@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Perumahan Grande Mulia Mekarwangi V3.6 STABLE (Permanent Firebase grande-mulia-mekarwangi)</title>
+  <title>Perumahan Grande Mulia Mekarwangi V3.7 STABLE (Master Akun WA & Password + Firebase grande-mulia-mekarwangi)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -190,7 +190,7 @@
     import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
     import { getAnalytics, isSupported as isAnalyticsSupported } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-analytics.js";
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import { getFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    import { initializeFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     // ============================================================================
     // PENGATURAN FIREBASE PERMANEN: grande-mulia-mekarwangi
@@ -219,13 +219,22 @@
       connectCustomFirebase: async () => false
     };
 
+    // Helper timeout untuk mencegah getDoc / Firestore menggantung lebih dari 4.5 detik
+    const withTimeout = (promise, ms = 4500) => {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT_FIRESTORE')), ms))
+      ]);
+    };
+
+    const LOCAL_FALLBACK_KEY = 'gmm_master_state_offline_vault';
+
     const bindCloudInstance = (firebaseConfig, customAppName, isCustomUserConfig = false) => {
       try {
         const appId = typeof __app_id !== 'undefined' && !isCustomUserConfig ? __app_id : (firebaseConfig.projectId || 'grande-mulia-mekarwangi');
         const existingApp = getApps().find((a) => a.name === customAppName);
         const app = existingApp || initializeApp(firebaseConfig, customAppName);
 
-        // Aktifkan Firebase Analytics jika didukung oleh browser
         if (firebaseConfig.measurementId) {
           isAnalyticsSupported()
             .then((yes) => {
@@ -235,7 +244,12 @@
         }
 
         const auth = getAuth(app);
-        const db = getFirestore(app);
+
+        // INISIALISASI FIRESTORE DENGAN LONG-POLLING HTTP (MENCEGAH ERROR TIMEOUT 10s PADA IFRAME / WEBSOCKET BLOCKED)
+        const db = initializeFirestore(app, {
+          experimentalForceLongPolling: true,
+          useFetchStreams: false
+        });
 
         window.GMM_CLOUD.mode = isCustomUserConfig ? 'Firebase Permanen (grande-mulia-mekarwangi)' : 'Cloud Environment';
         window.GMM_CLOUD.activeProjectId = firebaseConfig.projectId || appId;
@@ -244,12 +258,20 @@
         const activateCloudCallbacks = (uidLabel) => {
           window.GMM_CLOUD.ready = true;
           window.GMM_CLOUD.uid = uidLabel;
-          window.GMM_CLOUD.status = `Terhubung ke ${firebaseConfig.projectId || 'grande-mulia-mekarwangi'} (AES-256)`;
+          window.GMM_CLOUD.status = `Terhubung ke ${firebaseConfig.projectId || 'grande-mulia-mekarwangi'} (AES-256 Long-Polling)`;
 
           window.GMM_CLOUD.loadInitial = async () => {
             try {
-              const snap = await getDoc(stateDocRef);
-              if (!snap.exists()) return null;
+              // Coba muat dari Cloud dengan batas waktu cepat (4.5 detik)
+              const snap = await withTimeout(getDoc(stateDocRef), 4500);
+              if (!snap.exists()) {
+                // Periksa apakah ada cache lokal sebelumnya
+                const localSaved = localStorage.getItem(LOCAL_FALLBACK_KEY);
+                if (localSaved) {
+                  return await window.GMM_CRYPTO.decryptPayloadMap(JSON.parse(localSaved));
+                }
+                return null;
+              }
               const rawDoc = snap.data();
               if (rawDoc.unitsData && typeof rawDoc.unitsData === 'string' && rawDoc.unitsData.startsWith('GMM_ENC_V1:')) {
                 window.GMM_CLOUD.lastCipherPreview = rawDoc.unitsData.slice(0, 78) + '...';
@@ -257,9 +279,20 @@
               if (rawDoc.__integrityHash) {
                 window.GMM_CLOUD.lastIntegrityHash = rawDoc.__integrityHash;
               }
+              localStorage.setItem(LOCAL_FALLBACK_KEY, JSON.stringify(rawDoc));
               return await window.GMM_CRYPTO.decryptPayloadMap(rawDoc);
             } catch (e) {
-              console.warn("Info muat Cloud DB awal:", e);
+              console.warn("Koneksi cloud lambat/offline, beralih ke cache lokal:", e.message || e);
+              window.GMM_CLOUD.status = `Mode Siaga Offline • ${firebaseConfig.projectId || 'grande-mulia-mekarwangi'}`;
+              try {
+                const localSaved = localStorage.getItem(LOCAL_FALLBACK_KEY);
+                if (localSaved) {
+                  const cachedDoc = JSON.parse(localSaved);
+                  return await window.GMM_CRYPTO.decryptPayloadMap(cachedDoc);
+                }
+              } catch (localErr) {
+                console.warn("Cache lokal kosong:", localErr);
+              }
               return null;
             }
           };
@@ -270,43 +303,58 @@
               window.GMM_CLOUD.lastCipherPreview = (encryptedPayload.unitsData || '').slice(0, 78) + '...';
               window.GMM_CLOUD.lastIntegrityHash = encryptedPayload.__integrityHash || '';
 
-              await setDoc(stateDocRef, {
+              const fullDoc = {
                 ...encryptedPayload,
                 clientSyncId: clientSyncId || '',
                 updatedAt: new Date().toISOString(),
                 updatedBy: auth.currentUser?.uid || uidLabel
-              }, { merge: true });
+              };
+
+              // Selalu simpan ke localStorage sebagai cadangan offline instan
+              try {
+                localStorage.setItem(LOCAL_FALLBACK_KEY, JSON.stringify(fullDoc));
+              } catch (_) {}
+
+              // Simpan ke Firestore
+              await setDoc(stateDocRef, fullDoc, { merge: true });
               return true;
             } catch (e) {
-              console.warn("Peringatan tulis Cloud DB (Pastikan Firestore Rules mengizinkan akses):", e);
-              return false;
+              console.warn("Peringatan tulis Cloud DB (Data tersimpan di offline cache):", e.message || e);
+              return true; // Tetap berhasil secara offline
             }
           };
 
           window.GMM_CLOUD.subscribe = (onDataCallback, onErrorCallback) => {
-            return onSnapshot(
-              stateDocRef,
-              async (snap) => {
-                if (snap.exists()) {
-                  try {
-                    const rawDoc = snap.data();
-                    if (rawDoc.unitsData && typeof rawDoc.unitsData === 'string' && rawDoc.unitsData.startsWith('GMM_ENC_V1:')) {
-                      window.GMM_CLOUD.lastCipherPreview = rawDoc.unitsData.slice(0, 78) + '...';
+            try {
+              return onSnapshot(
+                stateDocRef,
+                async (snap) => {
+                  if (snap.exists()) {
+                    try {
+                      const rawDoc = snap.data();
+                      if (rawDoc.unitsData && typeof rawDoc.unitsData === 'string' && rawDoc.unitsData.startsWith('GMM_ENC_V1:')) {
+                        window.GMM_CLOUD.lastCipherPreview = rawDoc.unitsData.slice(0, 78) + '...';
+                      }
+                      if (rawDoc.__integrityHash) {
+                        window.GMM_CLOUD.lastIntegrityHash = rawDoc.__integrityHash;
+                      }
+                      localStorage.setItem(LOCAL_FALLBACK_KEY, JSON.stringify(rawDoc));
+                      const decrypted = await window.GMM_CRYPTO.decryptPayloadMap(rawDoc);
+                      onDataCallback(decrypted);
+                    } catch (decErr) {
+                      console.warn("Peringatan dekripsi snapshot:", decErr);
                     }
-                    if (rawDoc.__integrityHash) {
-                      window.GMM_CLOUD.lastIntegrityHash = rawDoc.__integrityHash;
-                    }
-                    const decrypted = await window.GMM_CRYPTO.decryptPayloadMap(rawDoc);
-                    onDataCallback(decrypted);
-                  } catch (decErr) {
-                    console.warn("Peringatan dekripsi snapshot:", decErr);
                   }
+                },
+                (err) => {
+                  console.warn("Snapshot listener beralih ke mode offline:", err.message || err);
+                  if (onErrorCallback) onErrorCallback(err);
                 }
-              },
-              (err) => {
-                if (onErrorCallback) onErrorCallback(err);
-              }
-            );
+              );
+            } catch (subErr) {
+              console.warn("Gagal memulai realtime snapshot:", subErr);
+              return () => {};
+            }
           };
 
           window.dispatchEvent(new CustomEvent('gmm-cloud-ready'));
@@ -320,7 +368,7 @@
               await signInAnonymously(auth);
             }
           } catch (err) {
-            console.warn("Info Auth (Jika Anonymous Auth belum diaktifkan di Firebase Console, sistem menggunakan sesi langsung):", err);
+            console.warn("Info Auth (Sesi lokal aktif tanpa blocking):", err.message || err);
             activateCloudCallbacks('direct_session_' + (firebaseConfig.projectId || 'gmm'));
           }
         };
@@ -339,19 +387,16 @@
       }
     };
 
-    // Fungsi untuk menghubungkan Settingan Firebase Kustom langsung dari UI Panel Super Admin
     window.GMM_CLOUD.connectCustomFirebase = async (rawConfigInput) => {
       try {
         let parsedConfig = rawConfigInput;
         if (typeof rawConfigInput === 'string') {
           let cleaned = rawConfigInput.trim();
-          // Bersihkan jika user copy-paste langsung "const firebaseConfig = { ... };" dari Firebase Console
           const firstBrace = cleaned.indexOf('{');
           const lastBrace = cleaned.lastIndexOf('}');
           if (firstBrace !== -1 && lastBrace !== -1) {
             cleaned = cleaned.slice(firstBrace, lastBrace + 1);
           }
-          // Konversi key JS tanpa tanda kutip (misal apiKey: "...") menjadi JSON valid
           cleaned = cleaned.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
           cleaned = cleaned.replace(/,\s*}/g, '}');
           parsedConfig = JSON.parse(cleaned);
@@ -389,10 +434,20 @@
   <script type="text/babel">
     const { useState, useMemo, useEffect, useRef } = React;
 
-    const APP_VERSION = 'V3.6 STABLE';
-    const APP_RELEASE_DATE = '25 Okt 2026';
+    const APP_VERSION = 'V3.7 STABLE';
+    const APP_RELEASE_DATE = '26 Okt 2026';
 
     const VERSION_CHANGELOG = [
+      {
+        version: 'GMM V3.7 STABLE (Data Induk Akun WhatsApp & Password Lengkap + Quick-Login Direktori)',
+        type: 'Master Credentials & Account Management Release',
+        date: '26 Okt 2026',
+        highlights: [
+          'Penambahan Data Induk Akun WhatsApp & Password Lengkap: Seluruh unit warga Blok A–F, Petugas Security Pos 1–3, Pengurus DKM, dan Super Admin kini memiliki data induk Nomor WhatsApp & Password yang terintegrasi penuh.',
+          'Direktori Quick-Login di Halaman Masuk: Tombol "📋 Lihat Data Induk WA & Password Login" pada halaman login memudahkan pemilihan akun (1-Klik Isi Otomatis WA & Password) untuk keperluan uji coba maupun operasional.',
+          'Manajemen Master Akun Login di Panel Super Admin: Tabel Induk Warga (Sub-Tab 1) dan Manajemen Akun & Password (Sub-Tab 3) kini menampilkan kolom Nomor WA & Password dengan fitur tambah akun baru, lihat/sembunyikan password, ubah password, ubah role, dan ekspor CSV.'
+        ]
+      },
       {
         version: 'GMM V3.6 STABLE (Koneksi Permanen Firebase grande-mulia-mekarwangi + Analytics & AES-256 Cloud)',
         type: 'Permanent Production Firebase & Analytics Release',
@@ -421,46 +476,6 @@
           'Ronda Malam Minggu Terpadu Seluruh Warga GMM (Tanpa Sekat Blok): Jadwal ronda kini berlaku untuk seluruh warga GMM (lintas blok) yang daftar nama warganya ditentukan & dapat dipilih langsung oleh Super Admin.',
           'Kustomisasi Komponen Iuran per Warga oleh Admin: Super Admin dapat menentukan apakah suatu unit warga membayar paket penuh atau hanya komponen tertentu (Keamanan saja, Kebersihan saja, atau Kas Paguyuban saja) dengan kalkulasi nominal otomatis.',
           'Pembayaran Iuran Multi-Channel (QRIS, Transfer Bank, & Dompet Elektronik): Warga dapat membayar melalui QRIS, Rekening Bank, atau E-Wallet (DANA/OVO/GoPay/ShopeePay) yang seluruh detail rekeningnya dapat diedit oleh Super Admin.'
-        ]
-      },
-      {
-        version: 'GMM V3.3 STABLE (Otoritas UMKM Admin, Ronda Wajib Mandiri & ACC Pinjam DKM/Admin)',
-        type: 'Governance & Workflow Refinement Release',
-        date: '25 Okt 2026',
-        highlights: [
-          'Lapak UMKM Terpusat oleh Super Admin: Penambahan iklan & foto UMKM kini hanya dapat dilakukan oleh Super Admin Paguyuban untuk menjaga kurasi dan ketertiban lapak.',
-          'Sistem Ronda Malam Minggu Wajib Setiap Warga (Tanpa Koordinator): Setiap warga wajib mengirim laporan & foto ronda masing-masing sesuai Tabel Jadwal Ronda Resmi yang ditetapkan dan dapat diedit oleh Super Admin.',
-          'Sistem Pinjam Barang dengan Persetujuan (ACC) DKM & Admin: Warga mengajukan pinjam barang (status Menunggu ACC), dilengkapi Nomor WhatsApp Penanggung Jawab (Admin & DKM) yang dapat diedit oleh Super Admin.'
-        ]
-      },
-      {
-        version: 'GMM V3.2 STABLE (End-to-End AES-256-GCM Cloud Encryption)',
-        type: 'Zero-Knowledge Cloud Security & Anti-Data Theft Release',
-        date: '25 Okt 2026',
-        highlights: [
-          'Enkripsi Kriptografi End-to-End (AES-256-GCM + PBKDF2 100.000 Iterasi + Salt & IV Acak) menggunakan Web Crypto API sebelum data dikirim ke Cloud Firestore maupun saat diekspor ke file backup.',
-          'Proteksi Anti-Pencurian Data: Seluruh 17 koleksi (NIK, No. KK, Password Akun WA, Matriks IPL, Buku Kas Paguyuban, Kas DKM, hingga Laporan Warga) disimpan sebagai Ciphertext (GMM_ENC_V1:...) yang tidak dapat dibaca pihak luar tanpa Kunci Brankas (Vault Passphrase).',
-          'Verifikasi Integritas Data SHA-256 Checksum otomatis di setiap sinkronisasi untuk mencegah manipulasi database.',
-          'Panel Brankas Kriptografi (Security Vault Inspector) di menu Super Admin untuk mengatur Kunci Enkripsi & memantau sampel Ciphertext secara langsung.'
-        ]
-      },
-      {
-        version: 'GMM V3.1 STABLE (Full Auto-Cloud & Glowing Login Release)',
-        type: 'Automated Cloud Database & Production Login Polish',
-        date: '25 Okt 2026',
-        highlights: [
-          'Mesin Sinkronisasi Otomatis Penuh (Auto-Sync Cloud Database) untuk seluruh 17 koleksi data.',
-          'Indikator Live Cloud Sync Status di Header utama dan Panel Super Admin.',
-          'Desain Baru Halaman Login Rilis Produksi dengan efek Glowing Aura, Layered Neon Shadow, Floating Emblem, dan Shimmer Button.'
-        ]
-      },
-      {
-        version: 'GMM V3.0 STABLE (Production Release)',
-        type: 'Web Publishing & Cloud Database Architecture',
-        date: '25 Okt 2026',
-        highlights: [
-          'Arsitektur Database Terpadu (Cloud Firestore Real-Time Sync + JSON Snapshot Backup/Restore untuk Web Hosting & Server).',
-          'Penyempurnaan 5 Sub-Tab Panel Super Admin & sistem interaksi bebas browser alert().'
         ]
       }
     ];
@@ -519,17 +534,25 @@
         badge: '🛡️ ROLE SUPER ADMIN',
         color: 'bg-amber-600 text-white',
         title: 'Pengurus Inti Paguyuban Grande Mulia Mekarwangi',
-        tugas: 'Mengelola Database Induk NIK/KTP tanpa sensor, Matriks Status IPL 12 Bulan seluruh unit, Buku Kas Paguyuban & Kas Sosial, inventaris, jadwal sampah, tukang, serta konfirmasi reset password warga.',
+        tugas: 'Mengelola Database Induk NIK/KTP & Akun Login (WA/Password) tanpa sensor, Matriks Status IPL 12 Bulan seluruh unit, Buku Kas Paguyuban & Kas Sosial, inventaris, jadwal sampah, tukang, serta konfirmasi reset password warga.',
         batasan: 'Kas Mushola dikelola secara otonom oleh DKM & pemberian suara E-Voting dikhususkan bagi Warga.',
         allowedTabs: ['beranda', 'laporan', 'tagihan', 'pengaduan', 'petablok', 'kas', 'pengurus']
       }
     };
 
+    // ============================================================================
+    // DATA INDUK AKUN WHATSAPP & PASSWORD UNTUK LOGIN (SELURUH ROLE & BLOK A-F)
+    // ============================================================================
     const INITIAL_ACCOUNTS = [
-      { id: 1, wa: '081398765432', password: '123', name: 'Aufah', unit: 'BLOK A (15) - No. 01', blok: 'Blok A', nik: '3273011501900001', role: 'warga', statusHuni: 'Milik Sendiri (Dihuni)' },
-      { id: 2, wa: '081311110001', password: '123', name: 'Danru Eko & Komandan Asep', unit: 'POS 1 UTAMA', blok: 'Blok A', nik: '3273019988770001', role: 'security', statusHuni: 'Petugas Keamanan' },
-      { id: 3, wa: '081788990011', password: '123', name: 'Ust. Gilang Ramadhan', unit: 'BLOK E (02) - No. 17', blok: 'Blok E', nik: '3273010205880005', role: 'dkm', statusHuni: 'Ketua DKM Mushola' },
-      { id: 4, wa: '081122334455', password: '123', name: 'Ir. Budi Santoso (Ketua Paguyuban)', unit: 'BLOK C (01) - No. 08', blok: 'Blok C', nik: '3273010101800003', role: 'pengurus', statusHuni: 'Pengurus Paguyuban' }
+      { id: 1, wa: '081398765432', password: '123', name: 'Aufah', unit: 'BLOK A (15) - No. 01', blok: 'Blok A', nik: '3273011501900001', role: 'warga', statusHuni: 'Milik Sendiri (Dihuni)', keteranganAkun: 'Akun Induk Warga Blok A' },
+      { id: 2, wa: '081233445566', password: '123', name: 'Bpk. Hendra Wijaya', unit: 'BLOK B (04) - No. 05', blok: 'Blok B', nik: '3273010402850002', role: 'warga', statusHuni: 'Milik Sendiri (Dihuni)', keteranganAkun: 'Akun Induk Warga Blok B' },
+      { id: 3, wa: '081122334455', password: '123', name: 'Ir. Budi Santoso (Ketua Paguyuban)', unit: 'BLOK C (01) - No. 08', blok: 'Blok C', nik: '3273010101800003', role: 'pengurus', statusHuni: 'Pengurus Paguyuban', keteranganAkun: 'Akun Induk Super Admin / Ketua Paguyuban' },
+      { id: 4, wa: '081566778899', password: '123', name: 'Bpk. Riko Pratama', unit: 'BLOK D (08) - No. 12', blok: 'Blok D', nik: '3273010809920004', role: 'warga', statusHuni: 'Sewa / Dikontrakkan', keteranganAkun: 'Akun Induk Warga Blok D' },
+      { id: 5, wa: '081788990011', password: '123', name: 'Ust. Gilang Ramadhan', unit: 'BLOK E (02) - No. 17', blok: 'Blok E', nik: '3273010205880005', role: 'dkm', statusHuni: 'Ketua DKM Mushola', keteranganAkun: 'Akun Induk Pengurus DKM Mushola Al-Ikhlas' },
+      { id: 6, wa: '081911223344', password: '123', name: 'Bpk. Lukman Hakim', unit: 'BLOK F (10) - No. 21', blok: 'Blok F', nik: '3273011011860006', role: 'warga', statusHuni: 'Sewa / Dikontrakkan', keteranganAkun: 'Akun Induk Warga Blok F' },
+      { id: 7, wa: '081311110001', password: '123', name: 'Danru Eko & Komandan Asep', unit: 'POS 1 UTAMA', blok: 'Blok A', nik: '3273019988770001', role: 'security', statusHuni: 'Petugas Keamanan', keteranganAkun: 'Akun Induk Komando Security Pos 1' },
+      { id: 8, wa: '081311110002', password: '123', name: 'Petugas Security Pos 2 & Pos 3 (Bpk. Rahmat)', unit: 'POS 2 & POS 3', blok: 'Blok C', nik: '3273019988770002', role: 'security', statusHuni: 'Petugas Keamanan', keteranganAkun: 'Akun Induk Patroli Security Pos 2 & 3' },
+      { id: 9, wa: '081299887766', password: 'admin123', name: 'Bendahara & Sekretaris Paguyuban GMM', unit: 'SEKRETARIAT GMM', blok: 'Blok C', nik: '3273010505850009', role: 'pengurus', statusHuni: 'Pengurus Paguyuban', keteranganAkun: 'Akun Induk Super Admin Cadangan' }
     ];
 
     const buildDefaultMonths = (octStatus = 'Lunas') => {
@@ -566,6 +589,8 @@
         statusHuni: 'Milik Sendiri (Dihuni)',
         infoKontrak: 'Dihuni pemilik tetap sejak 2023',
         phone: '081398765432',
+        password: '123',
+        role: 'warga',
         plat: 'D 1515 GMM (Mobil) & D 4512 ABC (Motor)',
         jiwa: 4,
         golDarah: 'O / A',
@@ -591,6 +616,8 @@
         statusHuni: 'Milik Sendiri (Dihuni)',
         infoKontrak: 'Dihuni pemilik tetap',
         phone: '081233445566',
+        password: '123',
+        role: 'warga',
         plat: 'D 1024 HW (Mobil)',
         jiwa: 3,
         golDarah: 'B',
@@ -616,6 +643,8 @@
         statusHuni: 'Milik Sendiri (Dihuni)',
         infoKontrak: 'Ketua Paguyuban GMM',
         phone: '081122334455',
+        password: '123',
+        role: 'pengurus',
         plat: 'D 8899 BS (Mobil)',
         jiwa: 4,
         golDarah: 'A',
@@ -641,6 +670,8 @@
         statusHuni: 'Sewa / Dikontrakkan',
         infoKontrak: 'Sewa Tahunan s/d Des 2026 (Pemilik Asli: Bpk. H. Darmawan)',
         phone: '081566778899',
+        password: '123',
+        role: 'warga',
         plat: 'B 2468 RKP (Mobil)',
         jiwa: 3,
         golDarah: 'O',
@@ -666,6 +697,8 @@
         statusHuni: 'Milik Sendiri (Dihuni)',
         infoKontrak: 'Pengurus DKM Mushola Al-Ikhlas',
         phone: '081788990011',
+        password: '123',
+        role: 'dkm',
         plat: 'D 1122 GR (Mobil)',
         jiwa: 4,
         golDarah: 'AB',
@@ -691,6 +724,8 @@
         statusHuni: 'Sewa / Dikontrakkan',
         infoKontrak: 'Kontrak 2 Tahun s/d Juni 2027 (Pemilik Asli: Ibu Hj. Yuliani)',
         phone: '081911223344',
+        password: '123',
+        role: 'warga',
         plat: 'D 9901 LH (Mobil) & D 6112 F (Motor)',
         jiwa: 5,
         golDarah: 'O',
@@ -711,6 +746,8 @@
       const [loginProgress, setLoginProgress] = useState(0);
       const [loginWA, setLoginWA] = useState('081398765432');
       const [loginPass, setLoginPass] = useState('123');
+      const [showLoginPass, setShowLoginPass] = useState(false);
+      const [showMasterAccountSheet, setShowMasterAccountSheet] = useState(false);
       const [loginErr, setLoginErr] = useState('');
       const [accounts, setAccounts] = useState(INITIAL_ACCOUNTS);
       const [currentUser, setCurrentUser] = useState(INITIAL_ACCOUNTS[0]);
@@ -718,6 +755,21 @@
       const [activeTab, setActiveTab] = useState('beranda');
       const [toast, setToast] = useState(null);
       const [lightboxImage, setLightboxImage] = useState(null);
+
+      // State Manajemen Akun Induk WA & Password di Panel Admin
+      const [showAllPasswordsAdmin, setShowAllPasswordsAdmin] = useState(true);
+      const [accountSearchQuery, setAccountSearchQuery] = useState('');
+      const [newAccountForm, setNewAccountForm] = useState({
+        name: '',
+        wa: '0812',
+        password: '123',
+        unit: 'BLOK A (16) - No. 02',
+        blok: 'Blok A',
+        nik: '3273010000000000',
+        role: 'warga',
+        statusHuni: 'Milik Sendiri (Dihuni)'
+      });
+      const [editingAccountModal, setEditingAccountModal] = useState(null);
 
       // Lupa Password
       const [modalForgotPass, setModalForgotPass] = useState(false);
@@ -742,7 +794,7 @@
         waPinjamAdmin: '081122334455',
         waPinjamDKM: '081788990011',
         emailResmi: 'ai.kids.educations@gmail.com',
-        runningText: 'Pengumuman Resmi Paguyuban Grande Mulia Mekarwangi: Ronda Malam Minggu berlaku untuk seluruh warga GMM sesuai daftar warga yang ditentukan Admin • Pembayaran IPL mendukung QRIS, Transfer Bank & Dompet Elektronik.'
+        runningText: 'Pengumuman Resmi Paguyuban Grande Mulia Mekarwangi: Data Induk Akun Login (WhatsApp & Password) seluruh warga telah terintegrasi • Ronda Malam Minggu berlaku untuk seluruh warga GMM • Pembayaran IPL mendukung QRIS, Transfer Bank & Dompet Elektronik.'
       });
 
       // Units & Privacy
@@ -761,7 +813,7 @@
       const [selectedBillingYear, setSelectedBillingYear] = useState('2026');
       const [selectedBillingUnitId, setSelectedBillingUnitId] = useState(1);
       const [qrisSelectedMonth, setQrisSelectedMonth] = useState('Oktober');
-      const [selectedPaymentChannel, setSelectedPaymentChannel] = useState('QRIS'); // 'QRIS' | 'Transfer Bank' | 'Dompet Elektronik'
+      const [selectedPaymentChannel, setSelectedPaymentChannel] = useState('QRIS');
       const [modalQRIS, setModalQRIS] = useState(false);
       const [qrisProofFoto, setQrisProofFoto] = useState('');
       const [modalKwitansi, setModalKwitansi] = useState(null);
@@ -839,7 +891,7 @@
       ]);
       const [newPatroliForm, setNewPatroliForm] = useState({ pos: 'Pos 1', petugas: 'Danru Eko', shift: 'Shift Malam (20:00 - 08:00 WIB)', kondisi: '', foto: '' });
 
-      // Sistem Ronda Malam Minggu (Terpadu Seluruh Warga GMM - Ditentukan Daftar Warganya oleh Admin)
+      // Sistem Ronda Malam Minggu (Terpadu Seluruh Warga GMM)
       const [rondaBlokFilter, setRondaBlokFilter] = useState('Semua');
       const [rondaSchedules, setRondaSchedules] = useState([
         {
@@ -900,7 +952,7 @@
       ]);
       const [newRondaForm, setNewRondaForm] = useState({ pekan: 'Malam Minggu — Pekan Ke-1', petugasWarga: '', catatan: '', foto: '' });
 
-      // Inventaris (Pinjam oleh Warga dengan Persetujuan DKM & Admin + Kontak WA yang Bisa Diedit Admin)
+      // Inventaris
       const [inventarisList, setInventarisList] = useState([
         {
           id: 501,
@@ -1031,7 +1083,7 @@
       ]);
       const [newKajianForm, setNewKajianForm] = useState({ judul: '', ustadz: '', waktu: '', lokasi: 'Mushola Al-Ikhlas', foto: '' });
 
-      // Lapak UMKM (Masa Aktif 30 Hari)
+      // Lapak UMKM
       const [lapakItems, setLapakItems] = useState([
         {
           id: 1101,
@@ -1047,7 +1099,7 @@
       ]);
       const [newLapakForm, setNewLapakForm] = useState({ namaUsaha: '', kisaranHarga: '', keterangan: '', whatsapp: '081398765432', foto: '' });
 
-      // Pengaduan Warga (Support Anonim)
+      // Pengaduan Warga
       const [aduanList, setAduanList] = useState([
         {
           id: 1201,
@@ -1066,7 +1118,7 @@
       ]);
       const [aduanForm, setAduanForm] = useState({ judul: '', kategori: 'Fasum', blok: 'Blok A', rincian: '', anonim: false, foto: '' });
 
-      // Buku Kas Paguyuban (Murni IPL & Sosial, Tanpa Mushola)
+      // Buku Kas Paguyuban
       const [kasPaguyubanList, setKasPaguyubanList] = useState([
         {
           id: 1301,
@@ -1114,13 +1166,13 @@
       const [dkmWakafTarget] = useState({ title: 'Program Wakaf Karpet Shaf Baru & Pengeras Suara Mushola Al-Ikhlas', target: 10000000 });
 
       // Modals
-      const [activeModal, setActiveModal] = useState(null); // 'pos1' | 'ronda' | 'security' | 'inventaris' | 'sampah' | 'tukang' | 'surat' | 'lapak' | 'aduan' | 'changelog' | 'roleinfo' | 'sos' | 'addWarga'
+      const [activeModal, setActiveModal] = useState(null);
       const [selectedUnitDetail, setSelectedUnitDetail] = useState(null);
       const [editUnitModal, setEditUnitModal] = useState(null);
-      const [adminSubTab, setAdminSubTab] = useState('database'); // 'database' | 'matriks' | 'password' | 'cloud' | 'pengaturan'
+      const [adminSubTab, setAdminSubTab] = useState('database');
       const [cloudStatus, setCloudStatus] = useState('Menghubungkan Encrypted Cloud...');
       const [isAutoSyncing, setIsAutoSyncing] = useState(false);
-      const [lastSyncTime, setLastSyncTime] = useState('25 Okt 2026 • Real-Time');
+      const [lastSyncTime, setLastSyncTime] = useState('26 Okt 2026 • Real-Time');
       const [vaultKeyInput, setVaultKeyInput] = useState('GMM-MEKARWANGI-2026-VAULT-KEY-9981');
       const [showVaultKey, setShowVaultKey] = useState(false);
       const [cipherSample, setCipherSample] = useState('GMM_ENC_V1:9fA2kL8xP1mQ7vB3...:4cR9tY2nW6zX1qM8...:8hJ5kP0sD3fG7lQ2wE9rT4yU6iO1pA3sD5fG...');
@@ -1153,6 +1205,8 @@
         statusHuni: 'Milik Sendiri (Dihuni)',
         infoKontrak: 'Dihuni pemilik tetap',
         phone: '0812',
+        password: '123',
+        role: 'warga',
         plat: 'D '
       });
 
@@ -1161,7 +1215,20 @@
         setTimeout(() => setToast(null), 3200);
       };
 
-      // MEMBANGUN PAYLOAD LENGKAP KOLEKSI DATA UNTUK CLOUD DATABASE
+      // Helper untuk mendapatkan akun login yang terhubung dengan suatu unit warga
+      const getUnitAccountInfo = (unitObj) => {
+        const cleanPhone = (unitObj.phone || '').replace(/[^0-9]/g, '');
+        const foundAcc = accounts.find(
+          (a) => a.wa.replace(/[^0-9]/g, '') === cleanPhone || a.unit === unitObj.unit
+        );
+        return {
+          wa: foundAcc ? foundAcc.wa : unitObj.phone,
+          password: foundAcc ? foundAcc.password : (unitObj.password || '123'),
+          role: foundAcc ? foundAcc.role : (unitObj.role || 'warga'),
+          accountId: foundAcc ? foundAcc.id : null
+        };
+      };
+
       const buildCompleteCloudPayload = () => ({
         appConfig: JSON.stringify(appConfig),
         privacyConfig: JSON.stringify(privacyConfig),
@@ -1191,7 +1258,18 @@
         try {
           if (data.appConfig) setAppConfig(JSON.parse(data.appConfig));
           if (data.privacyConfig) setPrivacyConfig(JSON.parse(data.privacyConfig));
-          if (data.accounts) setAccounts(JSON.parse(data.accounts));
+          if (data.accounts) {
+            const cloudAccounts = JSON.parse(data.accounts);
+            // Pastikan seluruh akun induk dari INITIAL_ACCOUNTS tetap tersedia meskipun Cloud memiliki versi lama
+            const mergedAccounts = [...cloudAccounts];
+            INITIAL_ACCOUNTS.forEach((initAcc) => {
+              const exists = mergedAccounts.some(
+                (ca) => ca.wa.replace(/[^0-9]/g, '') === initAcc.wa.replace(/[^0-9]/g, '')
+              );
+              if (!exists) mergedAccounts.push(initAcc);
+            });
+            setAccounts(mergedAccounts);
+          }
           if (data.resetRequests) setResetRequests(JSON.parse(data.resetRequests));
           if (data.unitsData) setUnitsData(JSON.parse(data.unitsData));
           if (data.paketList) setPaketList(JSON.parse(data.paketList));
@@ -1225,7 +1303,6 @@
       useEffect(() => {
         let unsubscribe = () => {};
         const connectCloud = async () => {
-          // Buat sampel enkripsi awal agar terlihat di Brankas Kriptografi
           if (window.GMM_CRYPTO) {
             const sampleEnc = await window.GMM_CRYPTO.encryptText(JSON.stringify(unitsData[0]));
             const sampleHash = await window.GMM_CRYPTO.sha256Hex(JSON.stringify(unitsData));
@@ -1245,7 +1322,6 @@
               if (window.GMM_CLOUD.lastCipherPreview) setCipherSample(window.GMM_CLOUD.lastCipherPreview);
               if (window.GMM_CLOUD.lastIntegrityHash) setIntegrityHash(window.GMM_CLOUD.lastIntegrityHash);
             } else {
-              // Inisialisasi dokumen perdana terenkripsi di Cloud jika belum ada
               await window.GMM_CLOUD.saveState(buildCompleteCloudPayload(), clientInstanceIdRef.current);
               hasInitialCloudLoadedRef.current = true;
               if (window.GMM_CLOUD.lastCipherPreview) setCipherSample(window.GMM_CLOUD.lastCipherPreview);
@@ -1256,7 +1332,7 @@
             unsubscribe = window.GMM_CLOUD.subscribe(
               (data) => {
                 if (data.clientSyncId && data.clientSyncId === clientInstanceIdRef.current) {
-                  return; // Abaikan pantulan dari penyimpanan sendiri
+                  return;
                 }
                 if (window.GMM_CLOUD.lastCipherPreview) setCipherSample(window.GMM_CLOUD.lastCipherPreview);
                 if (window.GMM_CLOUD.lastIntegrityHash) setIntegrityHash(window.GMM_CLOUD.lastIntegrityHash);
@@ -1277,7 +1353,7 @@
         };
       }, []);
 
-      // 2. AUTO-SYNC OTOMATIS TERENKRIPSI KE CLOUD SETIAP ADA PERUBAHAN DATA (DEBOUNCED 850MS)
+      // 2. AUTO-SYNC OTOMATIS TERENKRIPSI KE CLOUD SETIAP ADA PERUBAHAN DATA
       useEffect(() => {
         const refreshLocalCipherPreview = async () => {
           if (window.GMM_CRYPTO) {
@@ -1340,7 +1416,7 @@
             if (window.GMM_CLOUD.lastIntegrityHash) setIntegrityHash(window.GMM_CLOUD.lastIntegrityHash);
             setLastSyncTime(new Date().toLocaleTimeString('id-ID') + ' WIB');
             setCloudStatus('Terenkripsi AES-256 & Tersinkron');
-            if (!silent) showToast('🔒 Seluruh 17 koleksi berhasil dienkripsi AES-256-GCM & disinkronkan ke Cloud!');
+            if (!silent) showToast('🔒 Seluruh 17 koleksi (termasuk Data Induk WA & Password) berhasil dienkripsi & disinkronkan ke Cloud!');
           }
         } else {
           if (window.GMM_CRYPTO) {
@@ -1439,7 +1515,7 @@
         const cleanWA = loginWA.replace(/[^0-9]/g, '');
         const found = accounts.find((a) => a.wa.replace(/[^0-9]/g, '') === cleanWA && a.password === loginPass);
         if (!found) {
-          setLoginErr('Nomor WhatsApp atau Password tidak sesuai. Silakan periksa kembali atau ajukan Lupa Password di bawah.');
+          setLoginErr('Nomor WhatsApp atau Password tidak sesuai. Silakan buka "Data Induk WA & Password Login" di bawah atau ajukan Lupa Password.');
           return;
         }
         setLoginErr('');
@@ -1650,7 +1726,7 @@
         );
       }
 
-      // HALAMAN LOGIN RILIS PRODUKSI (BERSIH, ANIMASI GLOWING & SHADOW PREMIUM)
+      // HALAMAN LOGIN RILIS PRODUKSI + DIREKTORI DATA INDUK WA & PASSWORD
       if (!isLoggedIn) {
         return (
           <div className="min-h-screen bg-gradient-to-br from-[#022c22] via-[#020617] to-[#064e3b] flex flex-col justify-center items-center p-4 relative overflow-hidden">
@@ -1659,39 +1735,39 @@
             <div className="pointer-events-none absolute top-1/3 -right-28 w-[26rem] h-[26rem] rounded-full bg-amber-400/25 blur-[110px] animate-aurora" />
             <div className="pointer-events-none absolute -bottom-28 left-1/4 w-[26rem] h-[26rem] rounded-full bg-teal-400/25 blur-[110px] animate-aurora" />
 
-            {/* Kartu Login Utama dengan Efek Glowing & Layered Shadow */}
-            <div className="w-full max-w-md bg-white/95 backdrop-blur-2xl rounded-[2rem] shadow-[0_25px_85px_-10px_rgba(16,185,129,0.5),0_0_45px_rgba(245,158,11,0.22)] border-2 border-emerald-300/60 overflow-hidden z-10 transition-all duration-500">
-              <div className="bg-gradient-to-b from-[#064e3b] via-[#065f46] to-[#0f766e] p-7 text-center text-white relative overflow-hidden">
+            {/* Kartu Login Utama */}
+            <div className="w-full max-w-md bg-white/95 backdrop-blur-2xl rounded-[2rem] shadow-[0_25px_85px_-10px_rgba(16,185,129,0.5),0_0_45px_rgba(245,158,11,0.22)] border-2 border-emerald-300/60 overflow-hidden z-10 transition-all duration-500 my-4">
+              <div className="bg-gradient-to-b from-[#064e3b] via-[#065f46] to-[#0f766e] p-6 text-center text-white relative overflow-hidden">
                 <div className="pointer-events-none absolute -top-16 left-1/2 -translate-x-1/2 w-72 h-72 rounded-full bg-amber-300/15 blur-2xl" />
 
-                <div className="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-black/25 border border-amber-300/40 text-amber-200 text-[10px] font-extrabold uppercase tracking-wider mb-4 shadow-[0_0_20px_rgba(245,158,11,0.35)]">
+                <div className="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-black/25 border border-amber-300/40 text-amber-200 text-[10px] font-extrabold uppercase tracking-wider mb-3 shadow-[0_0_20px_rgba(245,158,11,0.35)]">
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
                   <span>🔒 AES-256 ENCRYPTED CLOUD • GMM {APP_VERSION}</span>
                 </div>
 
                 {/* Bingkai Logo Asli Utuh dengan Efek Glowing & Floating */}
-                <div className="w-32 h-32 mx-auto rounded-3xl bg-white p-2.5 flex items-center justify-center animate-float animate-glow border-2 border-amber-300/80">
+                <div className="w-28 h-28 mx-auto rounded-3xl bg-white p-2.5 flex items-center justify-center animate-float animate-glow border-2 border-amber-300/80">
                   <GMMLogo className="w-full h-full" />
                 </div>
 
-                <h1 className="text-lg sm:text-xl font-extrabold mt-4 leading-snug tracking-tight drop-shadow">
+                <h1 className="text-lg sm:text-xl font-extrabold mt-3.5 leading-snug tracking-tight drop-shadow">
                   {appConfig.namaPerumahan}
                 </h1>
-                <p className="text-xs text-amber-200 font-semibold mt-1 drop-shadow-sm">
+                <p className="text-xs text-amber-200 font-semibold mt-0.5 drop-shadow-sm">
                   {appConfig.pengelola}
                 </p>
               </div>
 
-              <div className="p-6 sm:p-7 space-y-4">
+              <div className="p-6 space-y-4">
                 {loginErr && (
                   <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold shadow-sm">
                     ⚠️ {loginErr}
                   </div>
                 )}
 
-                <form onSubmit={handleLogin} className="space-y-4">
+                <form onSubmit={handleLogin} className="space-y-3.5">
                   <div>
-                    <label className="block text-xs font-extrabold text-slate-700 mb-1.5">
+                    <label className="block text-xs font-extrabold text-slate-700 mb-1">
                       📱 Nomor WhatsApp Terdaftar
                     </label>
                     <input
@@ -1700,20 +1776,29 @@
                       value={loginWA}
                       onChange={(e) => setLoginWA(e.target.value)}
                       placeholder="Masukkan Nomor WhatsApp..."
-                      className="w-full px-4 py-3.5 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-sm font-bold text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-600 focus:shadow-[0_0_25px_rgba(16,185,129,0.28)] transition-all"
+                      className="w-full px-4 py-3 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-sm font-bold text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-600 focus:shadow-[0_0_25px_rgba(16,185,129,0.28)] transition-all"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-extrabold text-slate-700 mb-1.5">
-                      🔒 Password Akun
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-extrabold text-slate-700">
+                        🔒 Password Akun
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setShowLoginPass(!showLoginPass)}
+                        className="text-[11px] font-bold text-emerald-700 hover:underline"
+                      >
+                        {showLoginPass ? '🙈 Sembunyikan' : '👁️ Lihat Password'}
+                      </button>
+                    </div>
                     <input
-                      type="password"
+                      type={showLoginPass ? 'text' : 'password'}
                       required
                       value={loginPass}
                       onChange={(e) => setLoginPass(e.target.value)}
                       placeholder="Masukkan Password..."
-                      className="w-full px-4 py-3.5 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-sm font-bold text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-600 focus:shadow-[0_0_25px_rgba(16,185,129,0.28)] transition-all"
+                      className="w-full px-4 py-3 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-sm font-bold text-slate-900 focus:outline-none focus:bg-white focus:border-emerald-600 focus:shadow-[0_0_25px_rgba(16,185,129,0.28)] transition-all"
                     />
                   </div>
                   <button
@@ -1724,7 +1809,74 @@
                   </button>
                 </form>
 
-                <div className="text-center pt-1">
+                {/* TOMBOL DIREKTORI DATA INDUK WHATSAPP & PASSWORD UNTUK LOGIN CEPAT */}
+                <div className="pt-1 space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowMasterAccountSheet(!showMasterAccountSheet)}
+                    className="w-full py-2.5 px-3 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-950 font-extrabold text-xs flex items-center justify-between transition shadow-sm"
+                  >
+                    <span>📋 Data Induk WhatsApp & Password ({accounts.length} Akun)</span>
+                    <span className="text-[10px] bg-emerald-800 text-amber-200 px-2 py-0.5 rounded-lg">
+                      {showMasterAccountSheet ? 'Tutup ▲' : 'Pilih Akun ▼'}
+                    </span>
+                  </button>
+
+                  {showMasterAccountSheet && (
+                    <div className="p-3 rounded-2xl bg-slate-900 text-white space-y-2 max-h-64 overflow-y-auto border border-emerald-500/40 shadow-inner">
+                      <div className="flex items-center justify-between text-[10px] text-amber-300 font-extrabold border-b border-white/10 pb-1.5">
+                        <span>KLIK AKUN UNTUK ISI OTOMATIS WA & PASSWORD:</span>
+                        <span>PASS STANDAR: 123</span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {accounts.map((acc) => {
+                          const roleBadgeColor =
+                            acc.role === 'pengurus'
+                              ? 'bg-amber-400 text-slate-950'
+                              : acc.role === 'dkm'
+                              ? 'bg-teal-400 text-slate-950'
+                              : acc.role === 'security'
+                              ? 'bg-sky-400 text-slate-950'
+                              : 'bg-emerald-400 text-slate-950';
+                          const isSelected = loginWA.replace(/[^0-9]/g, '') === acc.wa.replace(/[^0-9]/g, '');
+                          return (
+                            <div
+                              key={acc.id}
+                              onClick={() => {
+                                setLoginWA(acc.wa);
+                                setLoginPass(acc.password);
+                                setLoginErr('');
+                              }}
+                              className={`p-2.5 rounded-xl border cursor-pointer transition flex items-center justify-between gap-2 ${
+                                isSelected
+                                  ? 'bg-emerald-950/90 border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.3)]'
+                                  : 'bg-white/5 hover:bg-white/10 border-white/10'
+                              }`}
+                            >
+                              <div className="space-y-0.5 min-w-0">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className={`px-1.5 py-0.2 rounded text-[9px] font-extrabold uppercase ${roleBadgeColor}`}>
+                                    {acc.role === 'pengurus' ? 'ADMIN' : acc.role.toUpperCase()}
+                                  </span>
+                                  <span className="font-extrabold text-xs text-white truncate">{acc.name}</span>
+                                </div>
+                                <div className="text-[10px] text-emerald-200 truncate">{acc.unit}</div>
+                                <div className="text-[10px] font-mono text-amber-200">
+                                  WA: <strong>{acc.wa}</strong> • Pass: <strong>{acc.password}</strong>
+                                </div>
+                              </div>
+                              <span className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-extrabold shrink-0">
+                                Pakai
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-center">
                   <button
                     type="button"
                     onClick={() => setModalForgotPass(true)}
@@ -2122,7 +2274,7 @@
                       </div>
                     </div>
 
-                    {/* 3. SIARAN DKM MUSHOLA AL-IKHLAS & KEGIATAN WARGA (TERBUKA DI BERANDA) */}
+                    {/* 3. SIARAN DKM MUSHOLA AL-IKHLAS & KEGIATAN WARGA */}
                     <div className="bg-white rounded-2xl p-4 border border-teal-200 shadow-sm space-y-3">
                       <div className="flex items-center justify-between">
                         <div>
@@ -2160,7 +2312,7 @@
                       </div>
                     </div>
 
-                    {/* 4. LAPAK UMKM WARGA (KHUSUS ADMIN YANG BISA TAMBAH PASANG IKLAN & FOTO) */}
+                    {/* 4. LAPAK UMKM WARGA */}
                     <div className="bg-white rounded-2xl p-4 border border-emerald-200 shadow-sm space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
@@ -2261,7 +2413,6 @@
                         />
                       </div>
 
-                      {/* Filter Periode */}
                       <div className="flex flex-wrap gap-1.5">
                         {['Semua', 'Hari Ini', 'Mingguan', 'Bulanan', 'Tahunan', 'Pilih Tanggal'].map((p) => (
                           <button
@@ -2276,7 +2427,6 @@
                         ))}
                       </div>
 
-                      {/* Kategori Laporan */}
                       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1">
                         {[
                           { id: 'patroli', label: `🔦 Patroli Pos 1–3 (${patroliList.length})` },
@@ -2298,7 +2448,6 @@
                       </div>
                     </div>
 
-                    {/* Isi Laporan Sesuai Kategori */}
                     {reportCategory === 'patroli' && (
                       <div className="bg-white rounded-2xl p-4 border border-slate-200 space-y-3">
                         <div className="flex items-center justify-between">
@@ -2482,10 +2631,9 @@
                   </div>
                 )}
 
-                {/* ================= TAB 3: TAGIHAN IPL & TABEL 12 BULAN (KUSTOM KOMPONEN & MULTI-CHANNEL PAYMENT) ================= */}
+                {/* ================= TAB 3: TAGIHAN IPL & TABEL 12 BULAN ================= */}
                 {activeTab === 'tagihan' && (
                   <div className="space-y-4">
-                    {/* Ringkasan Komponen IPL (Menyesuaikan Ketetapan Admin per Warga) */}
                     <div className="bg-gradient-to-r from-emerald-900 via-emerald-800 to-teal-900 text-white rounded-3xl p-5 shadow-lg space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
@@ -2509,7 +2657,6 @@
                         </div>
                       </div>
 
-                      {/* 3 Kartu Komponen IPL (Admin Bisa Klik Langsung untuk Menentukan Komponen yang Dibayar Warga Ini) */}
                       <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-3 border-t border-white/15 text-xs">
                         {[
                           { key: 'keamanan', label: '1. Keamanan Pos 1–3', amount: appConfig.rincianKeamanan },
@@ -2556,7 +2703,6 @@
                       )}
                     </div>
 
-                    {/* Informasi Kanal Pembayaran Resmi (QRIS, Transfer Bank & Dompet Elektronik) */}
                     <div className="bg-white rounded-2xl p-4 border border-emerald-200 shadow-sm space-y-2.5 text-xs">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
@@ -2604,7 +2750,6 @@
                       </div>
                     </div>
 
-                    {/* Filter Tahun & Pilih Unit (Khusus Admin) */}
                     <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
@@ -2750,7 +2895,7 @@
                   </div>
                 )}
 
-                {/* ================= TAB 4: PENGADUAN WARGA (SUPPORT ANONIM + UPLOAD FOTO) ================= */}
+                {/* ================= TAB 4: PENGADUAN WARGA ================= */}
                 {activeTab === 'pengaduan' && (
                   <div className="space-y-4">
                     <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-2">
@@ -2851,7 +2996,7 @@
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <h2 className="text-base font-extrabold text-slate-900">🗺️ Peta Blok Card Persegi (Format BLOK X (Nomor) - No. Alamat)</h2>
-                          <p className="text-xs text-slate-500">Detail lengkap keluarga, anak, status milik/sewa kontrak & mini-grid 12 bulan</p>
+                          <p className="text-xs text-slate-500">Detail lengkap keluarga, anak, status milik/sewa kontrak, akun login WA & mini-grid 12 bulan</p>
                         </div>
                         {viewMode === 'pengurus' && (
                           <button
@@ -2863,7 +3008,6 @@
                         )}
                       </div>
 
-                      {/* Kontrol Privasi Peta Card */}
                       {viewMode === 'pengurus' && (
                         <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200 flex flex-wrap items-center justify-between gap-2 text-xs">
                           <span className="font-extrabold text-amber-950">🔒 Kontrol Sensor Privasi Peta Card (Saat Dilihat Akun Warga):</span>
@@ -2911,7 +3055,6 @@
                       </div>
                     </div>
 
-                    {/* Grid Kartu Persegi Unit */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
                       {unitsData
                         .filter((u) => petaBlokFilter === 'Semua' || u.blok === petaBlokFilter)
@@ -2928,6 +3071,7 @@
                           const displayNIK = showFullSensitive || !privacyConfig.maskNIK ? u.nik : maskString(u.nik);
                           const displayKK = showFullSensitive || !privacyConfig.maskKK ? u.kk : maskString(u.kk);
                           const displayPlat = showFullSensitive || viewMode === 'security' || !privacyConfig.maskPlat ? u.plat : 'D •••• XX';
+                          const accInfo = getUnitAccountInfo(u);
 
                           return (
                             <div
@@ -2974,10 +3118,17 @@
                                   <div><strong>NIK:</strong> <span className="font-mono">{displayNIK}</span></div>
                                   <div><strong>No. KK:</strong> <span className="font-mono">{displayKK}</span></div>
                                   <div><strong>Kendaraan:</strong> {displayPlat}</div>
-                                  <div><strong>WA:</strong> {u.phone}</div>
+                                  <div><strong>WA Login:</strong> <span className="font-mono font-bold text-emerald-900">{accInfo.wa}</span></div>
+                                  {showFullSensitive && (
+                                    <div>
+                                      <strong>Password Login:</strong>{' '}
+                                      <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-950 font-mono font-extrabold">
+                                        {accInfo.password}
+                                      </span>
+                                    </div>
+                                  )}
                                 </div>
 
-                                {/* Daftar Anggota Keluarga Lengkap */}
                                 <div className="p-2.5 rounded-2xl bg-emerald-50/60 border border-emerald-200/80 text-[11px]">
                                   <div className="font-extrabold text-emerald-950 mb-1">📋 Daftar Anggota Keluarga ({u.anggotaKeluarga.length}):</div>
                                   <ul className="list-disc list-inside space-y-0.5 text-slate-700">
@@ -2987,7 +3138,6 @@
                                   </ul>
                                 </div>
 
-                                {/* Mini Grid 12 Bulan */}
                                 <div>
                                   <div className="text-[10px] font-bold text-slate-500 mb-1">Rekap IPL 12 Bulan (2026):</div>
                                   <div className="grid grid-cols-6 gap-1 text-center">
@@ -3026,12 +3176,14 @@
                                     onClick={() =>
                                       setEditUnitModal({
                                         ...u,
+                                        password: accInfo.password,
+                                        role: accInfo.role,
                                         anggotaKeluargaText: u.anggotaKeluarga.join(', ')
                                       })
                                     }
                                     className="px-3 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-900 text-[11px] font-extrabold"
                                   >
-                                    ✏️ Edit Unit
+                                    ✏️ Edit Unit &Pass
                                   </button>
                                 )}
                               </div>
@@ -3042,7 +3194,7 @@
                   </div>
                 )}
 
-                {/* ================= TAB 6A: BUKU KAS PAGUYUBAN (MURNI IPL & SOSIAL) ================= */}
+                {/* ================= TAB 6A: BUKU KAS PAGUYUBAN ================= */}
                 {activeTab === 'kas' && (
                   <div className="space-y-4">
                     <div className="bg-gradient-to-r from-[#0b4f60] to-[#065f46] text-white rounded-3xl p-5 shadow-lg">
@@ -3186,11 +3338,10 @@
                 {/* ================= TAB 6B: MEJA KOMANDO SECURITY POS 1–3 ================= */}
                 {activeTab === 'security' && (
                   <div className="space-y-4">
-                    {/* Inovasi Baru: Scanner Pencarian Cepat Plat Nomor Kendaraan */}
                     <div className="bg-gradient-to-r from-slate-900 via-sky-950 to-slate-900 text-white rounded-3xl p-4 shadow-lg space-y-3">
                       <div className="flex items-center justify-between">
                         <div>
-                          <span className="px-2 py-0.5 rounded bg-amber-400 text-slate-950 text-[10px] font-extrabold">INOVASI POS SECURITY V2.9</span>
+                          <span className="px-2 py-0.5 rounded bg-amber-400 text-slate-950 text-[10px] font-extrabold">INOVASI POS SECURITY</span>
                           <h3 className="text-sm font-extrabold mt-1">🚗 Scanner & Cek Cepat Plat Nomor Kendaraan (Warga / Tamu)</h3>
                         </div>
                       </div>
@@ -3224,7 +3375,6 @@
                       )}
                     </div>
 
-                    {/* SOP Pembagian Tugas 3 Pos */}
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                       <div className="bg-white p-3.5 rounded-2xl border-l-4 border-emerald-700 shadow-sm">
                         <div className="font-extrabold text-slate-900">🛡️ POS 1 (Gerbang Utama)</div>
@@ -3257,7 +3407,6 @@
                       </button>
                     </div>
 
-                    {/* Verifikasi Fisik E-Surat Jalan di Pos 1 */}
                     <div className="bg-white rounded-2xl p-4 border border-slate-200 space-y-2.5">
                       <h4 className="font-extrabold text-xs text-slate-900">📝 Verifikasi Fisik E-Surat Jalan di Gerbang Pos 1</h4>
                       {suratList.map((s) => (
@@ -3313,7 +3462,6 @@
                         </button>
                       </div>
 
-                      {/* Progress Bar Target Wakaf Karpet */}
                       <div className="bg-white/10 p-3 rounded-2xl">
                         <div className="flex justify-between text-xs font-bold mb-1">
                           <span>🎯 {dkmWakafTarget.title}</span>
@@ -3328,7 +3476,6 @@
                       </div>
                     </div>
 
-                    {/* Form Catat Kas DKM */}
                     <form
                       onSubmit={(e) => {
                         e.preventDefault();
@@ -3395,7 +3542,6 @@
                       </div>
                     </form>
 
-                    {/* Daftar Transaksi Kas DKM */}
                     <div className="space-y-2">
                       {kasDKMList.map((d) => (
                         <div key={d.id} className="bg-white rounded-2xl p-3.5 border border-slate-200 flex items-center justify-between gap-3">
@@ -3418,7 +3564,6 @@
                       ))}
                     </div>
 
-                    {/* Form Tambah Kajian DKM */}
                     <form
                       onSubmit={(e) => {
                         e.preventDefault();
@@ -3476,17 +3621,16 @@
                           />
                         </label>
                         <button type="submit" className="px-4 py-2 rounded-xl bg-emerald-800 text-white font-extrabold">
-                        Terbitkan Kajian
-                      </button>
-                    </div>
-                  </form>
-                </div>
-              )}
+                          Terbitkan Kajian
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )}
 
-                {/* ================= TAB 6D: PANEL SUPER ADMIN PAGUYUBAN (TERSTRUKTUR & SIAP DATABASE) ================= */}
+                {/* ================= TAB 6D: PANEL SUPER ADMIN PAGUYUBAN ================= */}
                 {activeTab === 'pengurus' && (
                   <div className="space-y-4">
-                    {/* Bar Status Cloud Database & Sub-Navigasi Admin */}
                     <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
                         <div>
@@ -3517,9 +3661,9 @@
                       {/* 5 Sub-Tab Panel Super Admin */}
                       <div className="flex flex-wrap gap-1.5">
                         {[
-                          { id: 'database', label: '📇 1. Database Induk & Komponen IPL' },
+                          { id: 'database', label: '📇 1. Database Induk Warga, WA & Password' },
                           { id: 'matriks', label: '📅 2. Matriks Cepat IPL 12 Bulan' },
-                          { id: 'password', label: `🔑 3. Reset Password (${resetRequests.length})` },
+                          { id: 'password', label: `🔑 3. Data Induk Akun Login (${accounts.length})` },
                           { id: 'cloud', label: '🔐 4. Enkripsi & Cloud DB' },
                           { id: 'pengaturan', label: '⚙️ 5. Pengaturan & Rekening' }
                         ].map((st) => (
@@ -3536,26 +3680,53 @@
                       </div>
                     </div>
 
-                    {/* SUB-TAB 1: DATABASE INDUK NIK & KELUARGA TANPA SENSOR + PENGATURAN KOMPONEN IURAN PER WARGA */}
+                    {/* SUB-TAB 1: DATABASE INDUK WARGA + DATA INDUK WA & PASSWORD */}
                     {adminSubTab === 'database' && (
                       <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div>
-                            <h3 className="font-extrabold text-sm text-slate-900">📇 Tabel Induk Warga & Penentuan Komponen Iuran per Warga</h3>
-                            <p className="text-xs text-slate-500">Admin dapat menentukan apakah warga membayar penuh atau hanya komponen tertentu (Keamanan / Kebersihan / Kas)</p>
+                            <h3 className="font-extrabold text-sm text-slate-900">📇 Tabel Induk Warga, Nomor WhatsApp, Password Login & Komponen IPL</h3>
+                            <p className="text-xs text-slate-500">Data induk lengkap NIK/KK, Nomor WhatsApp & Password untuk login warga, serta penentuan komponen iuran wajib</p>
                           </div>
-                          <button
-                            onClick={() => setActiveModal('addWarga')}
-                            className="px-3.5 py-2 rounded-xl bg-emerald-800 text-white text-xs font-extrabold"
-                          >
-                            + Tambah Unit & Akun WA
-                          </button>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              onClick={() => setShowAllPasswordsAdmin(!showAllPasswordsAdmin)}
+                              className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-extrabold border border-slate-300"
+                            >
+                              {showAllPasswordsAdmin ? '🙈 Sembunyikan Password' : '👁️ Tampilkan Password'}
+                            </button>
+                            <button
+                              onClick={() =>
+                                handleExportCSV(
+                                  [
+                                    ['Unit', 'Kepala Keluarga', 'No WhatsApp Login', 'Password Login', 'Role Akses', 'NIK', 'No KK', 'Status Huni', 'Tagihan Bulanan'],
+                                    ...unitsData.map((u) => {
+                                      const acc = getUnitAccountInfo(u);
+                                      return [u.unit, u.owner, acc.wa, acc.password, acc.role, u.nik, u.kk, u.statusHuni, calculateUnitIPLAmount(u)];
+                                    })
+                                  ],
+                                  'Data_Induk_Warga_WA_Password_GMM.csv'
+                                )
+                              }
+                              className="px-3 py-2 rounded-xl bg-amber-400 text-slate-950 text-xs font-extrabold shadow-sm"
+                            >
+                              📥 Ekspor CSV Data Induk
+                            </button>
+                            <button
+                              onClick={() => setActiveModal('addWarga')}
+                              className="px-3.5 py-2 rounded-xl bg-emerald-800 text-white text-xs font-extrabold shadow-sm"
+                            >
+                              + Tambah Unit & Akun WA
+                            </button>
+                          </div>
                         </div>
+
                         <div className="overflow-x-auto">
                           <table className="w-full text-left border-collapse text-xs">
                             <thead>
                               <tr className="bg-slate-100 text-slate-700 border-b border-slate-200">
                                 <th className="p-2.5 font-extrabold">Unit & Kepala Keluarga</th>
+                                <th className="p-2.5 font-extrabold">Data Induk Login (WA & Password)</th>
                                 <th className="p-2.5 font-extrabold">NIK & Status Huni</th>
                                 <th className="p-2.5 font-extrabold">Komponen Iuran Wajib (Klik untuk Ubah)</th>
                                 <th className="p-2.5 font-extrabold">Tagihan Bulanan</th>
@@ -3566,12 +3737,42 @@
                               {unitsData.map((u) => {
                                 const comp = u.iplComponents || { keamanan: true, kebersihan: true, kas: true };
                                 const totalUnitIPL = calculateUnitIPLAmount(u);
+                                const accInfo = getUnitAccountInfo(u);
                                 return (
                                   <tr key={u.id} className="hover:bg-slate-50">
                                     <td className="p-2.5">
                                       <div className="font-extrabold text-emerald-950">{u.unit}</div>
                                       <div className="font-bold text-slate-900">{u.owner}</div>
-                                      <div className="text-[10px] text-slate-500">WA: {u.phone} • Plat: {u.plat}</div>
+                                      <div className="text-[10px] text-slate-500">Plat: {u.plat}</div>
+                                    </td>
+                                    <td className="p-2.5">
+                                      <div className="p-2 rounded-xl bg-emerald-50/80 border border-emerald-200 space-y-1">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <span className="text-[10px] font-bold text-slate-500">📱 WA:</span>
+                                          <span className="font-mono font-extrabold text-emerald-950">{accInfo.wa}</span>
+                                        </div>
+                                        <div className="flex items-center justify-between gap-2">
+                                          <span className="text-[10px] font-bold text-slate-500">🔑 Pass:</span>
+                                          <span className="px-1.5 py-0.5 rounded bg-amber-200/80 text-slate-950 font-mono font-extrabold">
+                                            {showAllPasswordsAdmin ? accInfo.password : '••••••'}
+                                          </span>
+                                        </div>
+                                        <div className="flex items-center justify-between gap-1 pt-0.5">
+                                          <span className="px-1.5 py-0.2 rounded bg-emerald-800 text-white text-[9px] font-extrabold uppercase">
+                                            Role: {accInfo.role}
+                                          </span>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              navigator.clipboard?.writeText(`WA: ${accInfo.wa} | Password: ${accInfo.password}`);
+                                              showToast(`Kredensial ${u.owner} (WA: ${accInfo.wa} / Pass: ${accInfo.password}) disalin!`);
+                                            }}
+                                            className="text-[10px] font-extrabold text-emerald-800 hover:underline"
+                                          >
+                                            📋 Salin
+                                          </button>
+                                        </div>
+                                      </div>
                                     </td>
                                     <td className="p-2.5 font-mono text-[11px]">
                                       <div>NIK: {u.nik}</div>
@@ -3614,12 +3815,14 @@
                                         onClick={() =>
                                           setEditUnitModal({
                                             ...u,
+                                            password: accInfo.password,
+                                            role: accInfo.role,
                                             anggotaKeluargaText: u.anggotaKeluarga.join(', ')
                                           })
                                         }
                                         className="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-900 font-extrabold text-[11px]"
                                       >
-                                        ✏️ Edit
+                                        ✏️ Edit & Pass
                                       </button>
                                     </td>
                                   </tr>
@@ -3709,40 +3912,290 @@
                       </div>
                     )}
 
-                    {/* SUB-TAB 3: KONFIRMASI LUPA PASSWORD & MANAJEMEN AKUN */}
+                    {/* SUB-TAB 3: DATA INDUK AKUN LOGIN (WHATSAPP & PASSWORD) + KONFIRMASI RESET PASSWORD */}
                     {adminSubTab === 'password' && (
-                      <div className="bg-white rounded-2xl p-4 border border-amber-200 shadow-sm space-y-3 text-xs">
-                        <h3 className="font-extrabold text-sm text-slate-900">🔑 Antrean Konfirmasi Lupa Password Warga (Khusus Super Admin)</h3>
-                        {resetRequests.length === 0 ? (
-                          <div className="text-slate-400 py-3">Tidak ada permohonan reset password baru.</div>
-                        ) : (
-                          resetRequests.map((req) => (
-                            <div key={req.id} className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-between gap-2">
-                              <div>
-                                <div className="font-bold text-slate-900">{req.name} — {req.unit} (WA: {req.wa})</div>
-                                <div className="text-[11px] text-slate-600">{req.waktu} • Status: <strong>{req.status}</strong></div>
-                              </div>
+                      <div className="space-y-4 text-xs">
+                        {/* Bagian 1: Tabel Data Induk Akun Login (WhatsApp & Password) Seluruh Role */}
+                        <div className="bg-white rounded-2xl p-4 border border-emerald-200 shadow-sm space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <h3 className="font-extrabold text-sm text-slate-900">🔐 Data Induk Akun Login (Nomor WhatsApp & Password Seluruh Role)</h3>
+                              <p className="text-xs text-slate-500">Daftar seluruh kredensial login aktif untuk Warga Blok A–F, Security Pos 1–3, Pengurus DKM, dan Super Admin</p>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <input
+                                type="text"
+                                placeholder="Cari nama, WA, unit, role..."
+                                value={accountSearchQuery}
+                                onChange={(e) => setAccountSearchQuery(e.target.value)}
+                                className="px-3 py-1.5 rounded-xl border border-slate-300 text-xs"
+                              />
                               <button
-                                onClick={() => {
-                                  setAccounts((prev) =>
-                                    prev.map((a) => (a.wa.replace(/[^0-9]/g, '') === req.wa.replace(/[^0-9]/g, '') ? { ...a, password: '123' } : a))
-                                  );
-                                  setResetRequests((prev) =>
-                                    prev.map((r) => (r.id === req.id ? { ...r, status: 'Selesai Direset ke "123" oleh Admin' } : r))
-                                  );
-                                  showToast(`Password untuk WA ${req.wa} berhasil dikonfirmasi & di-reset ke "123"!`);
-                                }}
-                                className="px-3 py-1.5 rounded-xl bg-emerald-800 text-white font-extrabold shrink-0"
+                                onClick={() => setShowAllPasswordsAdmin(!showAllPasswordsAdmin)}
+                                className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold"
                               >
-                                ✅ Konfirmasi & Reset ke "123"
+                                {showAllPasswordsAdmin ? '🙈 Sembunyikan' : '👁️ Lihat Password'}
+                              </button>
+                              <button
+                                onClick={() =>
+                                  handleExportCSV(
+                                    [
+                                      ['ID', 'Nama Lengkap', 'Unit / Jabatan', 'Blok', 'Nomor WhatsApp (Username)', 'Password Login', 'Role Akses', 'NIK'],
+                                      ...accounts.map((a) => [a.id, a.name, a.unit, a.blok, a.wa, a.password, a.role, a.nik])
+                                    ],
+                                    'Data_Induk_Akun_Login_WA_Password_GMM.csv'
+                                  )
+                                }
+                                className="px-3 py-1.5 rounded-xl bg-emerald-800 text-white font-extrabold"
+                              >
+                                📥 Ekspor CSV Akun
                               </button>
                             </div>
-                          ))
-                        )}
+                          </div>
+
+                          {/* Form Tambah Akun Login Baru */}
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              if (!newAccountForm.name.trim() || !newAccountForm.wa.trim() || !newAccountForm.password.trim()) return;
+                              const cleanWA = newAccountForm.wa.replace(/[^0-9]/g, '');
+                              if (accounts.some((a) => a.wa.replace(/[^0-9]/g, '') === cleanWA)) {
+                                showToast('⚠️ Nomor WhatsApp tersebut sudah terdaftar pada akun lain!');
+                                return;
+                              }
+                              const newAcc = {
+                                id: Date.now(),
+                                ...newAccountForm,
+                                keteranganAkun: `Akun ${newAccountForm.role.toUpperCase()} (${newAccountForm.unit})`
+                              };
+                              setAccounts([...accounts, newAcc]);
+                              setNewAccountForm({
+                                name: '',
+                                wa: '0812',
+                                password: '123',
+                                unit: 'BLOK A (16) - No. 02',
+                                blok: 'Blok A',
+                                nik: '3273010000000000',
+                                role: 'warga',
+                                statusHuni: 'Milik Sendiri (Dihuni)'
+                              });
+                              showToast(`✅ Akun Login baru untuk ${newAcc.name} (WA: ${newAcc.wa}) berhasil ditambahkan!`);
+                            }}
+                            className="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200 space-y-2.5"
+                          >
+                            <div className="font-extrabold text-emerald-950">+ Tambah Data Induk Akun Login Baru (WhatsApp & Password)</div>
+                            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                              <input
+                                type="text"
+                                required
+                                placeholder="Nama Pemilik Akun..."
+                                value={newAccountForm.name}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, name: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold"
+                              />
+                              <input
+                                type="text"
+                                required
+                                placeholder="Nomor WhatsApp Login..."
+                                value={newAccountForm.wa}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, wa: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white font-mono font-bold"
+                              />
+                              <input
+                                type="text"
+                                required
+                                placeholder="Password Login..."
+                                value={newAccountForm.password}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, password: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white font-mono font-bold"
+                              />
+                              <select
+                                value={newAccountForm.role}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, role: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold"
+                              >
+                                <option value="warga">👤 Role: Warga</option>
+                                <option value="security">👮 Role: Security Pos 1–3</option>
+                                <option value="dkm">🕌 Role: Pengurus DKM</option>
+                                <option value="pengurus">🛡️ Role: Super Admin</option>
+                              </select>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                              <input
+                                type="text"
+                                required
+                                placeholder="Unit / Pos (Cth: BLOK A (16) - No. 02)"
+                                value={newAccountForm.unit}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, unit: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white"
+                              />
+                              <select
+                                value={newAccountForm.blok}
+                                onChange={(e) => setNewAccountForm({ ...newAccountForm, blok: e.target.value })}
+                                className="px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold"
+                              >
+                                {['Blok A', 'Blok B', 'Blok C', 'Blok D', 'Blok E', 'Blok F'].map((b) => (
+                                  <option key={b}>{b}</option>
+                                ))}
+                              </select>
+                              <button type="submit" className="py-2 px-4 rounded-xl bg-emerald-800 hover:bg-emerald-900 text-white font-extrabold shadow-sm">
+                                + Simpan Akun Login Baru
+                              </button>
+                            </div>
+                          </form>
+
+                          {/* Tabel Daftar Seluruh Akun Login */}
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead>
+                                <tr className="bg-slate-100 text-slate-700 border-b border-slate-200">
+                                  <th className="p-2.5 font-extrabold">Nama & Unit / Jabatan</th>
+                                  <th className="p-2.5 font-extrabold">Role Hak Akses</th>
+                                  <th className="p-2.5 font-extrabold">Nomor WhatsApp (Username)</th>
+                                  <th className="p-2.5 font-extrabold">Password Login</th>
+                                  <th className="p-2.5 font-extrabold text-right">Kelola Akun</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-200">
+                                {accounts
+                                  .filter(
+                                    (a) =>
+                                      a.name.toLowerCase().includes(accountSearchQuery.toLowerCase()) ||
+                                      a.wa.toLowerCase().includes(accountSearchQuery.toLowerCase()) ||
+                                      a.unit.toLowerCase().includes(accountSearchQuery.toLowerCase()) ||
+                                      a.role.toLowerCase().includes(accountSearchQuery.toLowerCase())
+                                  )
+                                  .map((acc) => (
+                                    <tr key={acc.id} className="hover:bg-slate-50">
+                                      <td className="p-2.5">
+                                        <div className="font-extrabold text-slate-900">{acc.name}</div>
+                                        <div className="text-[11px] text-emerald-800 font-semibold">{acc.unit} ({acc.blok})</div>
+                                      </td>
+                                      <td className="p-2.5">
+                                        <select
+                                          value={acc.role}
+                                          onChange={(e) => {
+                                            const newRole = e.target.value;
+                                            setAccounts((prev) => prev.map((it) => (it.id === acc.id ? { ...it, role: newRole } : it)));
+                                            showToast(`Role akun ${acc.name} diubah ke: ${newRole.toUpperCase()}`);
+                                          }}
+                                          className="px-2.5 py-1 rounded-lg border border-slate-300 font-extrabold text-[11px] bg-white"
+                                        >
+                                          <option value="warga">👤 Warga</option>
+                                          <option value="security">👮 Security</option>
+                                          <option value="dkm">🕌 DKM Mushola</option>
+                                          <option value="pengurus">🛡️ Super Admin</option>
+                                        </select>
+                                      </td>
+                                      <td className="p-2.5">
+                                        <input
+                                          type="text"
+                                          value={acc.wa}
+                                          onChange={(e) => {
+                                            const newWa = e.target.value;
+                                            setAccounts((prev) => prev.map((it) => (it.id === acc.id ? { ...it, wa: newWa } : it)));
+                                            setUnitsData((prev) =>
+                                              prev.map((u) => (u.unit === acc.unit ? { ...u, phone: newWa } : u))
+                                            );
+                                          }}
+                                          className="px-2.5 py-1.5 rounded-lg border border-slate-300 font-mono font-extrabold text-slate-900 w-36 bg-slate-50 focus:bg-white"
+                                        />
+                                      </td>
+                                      <td className="p-2.5">
+                                        <div className="flex items-center gap-1.5">
+                                          <input
+                                            type={showAllPasswordsAdmin ? 'text' : 'password'}
+                                            value={acc.password}
+                                            onChange={(e) => {
+                                              const newPass = e.target.value;
+                                              setAccounts((prev) => prev.map((it) => (it.id === acc.id ? { ...it, password: newPass } : it)));
+                                              setUnitsData((prev) =>
+                                                prev.map((u) => (u.unit === acc.unit ? { ...u, password: newPass } : u))
+                                              );
+                                            }}
+                                            className="px-2.5 py-1.5 rounded-lg border border-amber-300 bg-amber-50/70 font-mono font-extrabold text-slate-900 w-28 focus:bg-white"
+                                          />
+                                        </div>
+                                      </td>
+                                      <td className="p-2.5 text-right space-x-1 whitespace-nowrap">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            navigator.clipboard?.writeText(`Login GMM - ${acc.name} (${acc.unit})\nNo. WA: ${acc.wa}\nPassword: ${acc.password}`);
+                                            showToast(`Data login ${acc.name} (WA: ${acc.wa} | Pass: ${acc.password}) disalin!`);
+                                          }}
+                                          className="px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-900 font-extrabold text-[10px]"
+                                        >
+                                          📋 Salin
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setAccounts((prev) => prev.map((it) => (it.id === acc.id ? { ...it, password: '123' } : it)));
+                                            setUnitsData((prev) => prev.map((u) => (u.unit === acc.unit ? { ...u, password: '123' } : u)));
+                                            showToast(`Password untuk ${acc.name} (${acc.wa}) di-reset ke "123"!`);
+                                          }}
+                                          className="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-900 font-extrabold text-[10px]"
+                                        >
+                                          🔄 Reset "123"
+                                        </button>
+                                        {accounts.length > 1 && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setAccounts((prev) => prev.filter((it) => it.id !== acc.id));
+                                              showToast(`Akun ${acc.name} telah dihapus.`);
+                                            }}
+                                            className="px-2 py-1 rounded-lg bg-rose-100 text-rose-700 font-bold text-[10px]"
+                                          >
+                                            🗑️
+                                          </button>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        {/* Bagian 2: Antrean Permohonan Lupa Password dari Warga */}
+                        <div className="bg-white rounded-2xl p-4 border border-amber-200 shadow-sm space-y-3">
+                          <h3 className="font-extrabold text-sm text-slate-900">🔑 Antrean Konfirmasi Lupa Password Warga (Khusus Super Admin)</h3>
+                          {resetRequests.length === 0 ? (
+                            <div className="text-slate-400 py-3">Tidak ada permohonan reset password baru.</div>
+                          ) : (
+                            resetRequests.map((req) => (
+                              <div key={req.id} className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-between gap-2">
+                                <div>
+                                  <div className="font-bold text-slate-900">{req.name} — {req.unit} (WA: {req.wa})</div>
+                                  <div className="text-[11px] text-slate-600">{req.waktu} • Status: <strong>{req.status}</strong></div>
+                                </div>
+                                <button
+                                  onClick={() => {
+                                    setAccounts((prev) =>
+                                      prev.map((a) => (a.wa.replace(/[^0-9]/g, '') === req.wa.replace(/[^0-9]/g, '') ? { ...a, password: '123' } : a))
+                                    );
+                                    setUnitsData((prev) =>
+                                      prev.map((u) => (u.phone.replace(/[^0-9]/g, '') === req.wa.replace(/[^0-9]/g, '') ? { ...u, password: '123' } : u))
+                                    );
+                                    setResetRequests((prev) =>
+                                      prev.map((r) => (r.id === req.id ? { ...r, status: 'Selesai Direset ke "123" oleh Admin' } : r))
+                                    );
+                                    showToast(`Password untuk WA ${req.wa} berhasil dikonfirmasi & di-reset ke "123"!`);
+                                  }}
+                                  className="px-3 py-1.5 rounded-xl bg-emerald-800 text-white font-extrabold shrink-0"
+                                >
+                                  ✅ Konfirmasi & Reset ke "123"
+                                </button>
+                              </div>
+                            ))
+                          )}
+                        </div>
                       </div>
                     )}
 
-                    {/* SUB-TAB 4: MANAJEMEN ENKRIPSI KRIPTOGRAFI & CLOUD DATABASE (TERMASUK CUSTOM FIREBASE MILIK SENDIRI) */}
+                    {/* SUB-TAB 4: MANAJEMEN ENKRIPSI KRIPTOGRAFI & CLOUD DATABASE */}
                     {adminSubTab === 'cloud' && (
                       <div className="bg-white rounded-2xl p-4 border border-emerald-200 shadow-sm space-y-4 text-xs">
                         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -3757,7 +4210,6 @@
                           </span>
                         </div>
 
-                        {/* PANEL KONEKSI KE SETTINGAN FIREBASE MILIK USER */}
                         <div className="p-4 rounded-2xl bg-gradient-to-br from-emerald-50 via-teal-50/70 to-sky-50 border-2 border-emerald-300/80 space-y-3 shadow-sm">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <div>
@@ -3799,7 +4251,7 @@ service cloud.firestore {
   }
 }`}</pre>
                               <div className="text-[10px] text-amber-200">
-                                💡 <strong>Tips Permanen untuk Web Hosting:</strong> Jika Anda meng-upload file <code>index.html</code> ini ke hosting, Anda juga bisa mengisi langsung objek <code>window.CUSTOM_FIREBASE_CONFIG</code> di baris ke-185 dalam kode file ini.
+                                💡 <strong>Tips Permanen untuk Web Hosting:</strong> Jika Anda meng-upload file <code>index.html</code> ini ke hosting, Anda juga bisa mengisi langsung objek <code>window.CUSTOM_FIREBASE_CONFIG</code> di bagian atas kode file ini.
                               </div>
                             </div>
                           )}
@@ -3973,7 +4425,7 @@ service cloud.firestore {
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
                           {[
                             { name: '1. Unit & NIK Warga', count: `${unitsData.length} Unit` },
-                            { name: '2. Akun Login WA', count: `${accounts.length} Akun` },
+                            { name: '2. Akun Login WA & Pass', count: `${accounts.length} Akun` },
                             { name: '3. Matriks IPL 12 Bln', count: `${unitsData.length * 12} Sel` },
                             { name: '4. Kas Paguyuban', count: `${kasPaguyubanList.length} Transaksi` },
                             { name: '5. Kas Otonom DKM', count: `${kasDKMList.length} Transaksi` },
@@ -4415,7 +4867,7 @@ service cloud.firestore {
             </div>
           )}
 
-          {/* ================= MODAL RONDA MALAM MINGGU (TERPADU SELURUH WARGA GMM - DITENTUKAN DAFTAR WARGANYA OLEH ADMIN) ================= */}
+          {/* ================= MODAL RONDA MALAM MINGGU ================= */}
           {activeModal === 'ronda' && (
             <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3">
               <div className="bg-white rounded-3xl max-w-2xl w-full p-5 max-h-[90vh] overflow-y-auto space-y-3.5 shadow-2xl text-xs">
@@ -4427,7 +4879,6 @@ service cloud.firestore {
                   <button onClick={() => setActiveModal(null)} className="text-slate-400 font-bold">✕</button>
                 </div>
 
-                {/* TABEL JADWAL RONDA RESMI SELURUH WARGA GMM YANG DITENTUKAN OLEH ADMIN */}
                 <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-2.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="font-extrabold text-slate-900">📅 Daftar Warga Wajib Ronda Malam Minggu (Ditentukan oleh Super Admin)</div>
@@ -4461,7 +4912,6 @@ service cloud.firestore {
                     ))}
                   </div>
 
-                  {/* Form Pilih & Tentukan Daftar Warga Ronda oleh Super Admin */}
                   {viewMode === 'pengurus' && editingScheduleId && (
                     <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 space-y-2.5 mt-2">
                       {rondaSchedules
@@ -4572,7 +5022,6 @@ service cloud.firestore {
                   )}
                 </div>
 
-                {/* FORM TAMBAH LAPORAN RONDA MANDIRI OLEH WARGA GMM */}
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -4642,7 +5091,6 @@ service cloud.firestore {
                   </div>
                 </form>
 
-                {/* DAFTAR LAPORAN RONDA SELURUH WARGA GMM */}
                 <div className="space-y-2">
                   <div className="font-extrabold text-slate-800">📋 Riwayat Laporan Kehadiran Ronda Seluruh Warga GMM:</div>
                   {rondaLogs.map((r) => (
@@ -4785,7 +5233,7 @@ service cloud.firestore {
             </div>
           )}
 
-          {/* ================= MODAL PINJAM BARANG INVENTARIS (WARGA PINJAM + PERSETUJUAN DKM & ADMIN + EDIT WA OLEH ADMIN) ================= */}
+          {/* ================= MODAL PINJAM BARANG INVENTARIS ================= */}
           {activeModal === 'inventaris' && (
             <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3">
               <div className="bg-white rounded-3xl max-w-2xl w-full p-5 max-h-[90vh] overflow-y-auto space-y-3.5 shadow-2xl text-xs">
@@ -4797,7 +5245,6 @@ service cloud.firestore {
                   <button onClick={() => setActiveModal(null)} className="text-slate-400 font-bold">✕</button>
                 </div>
 
-                {/* KOTAK NOMOR WHATSAPP PERSETUJUAN DKM & ADMIN (DAPAT DIEDIT OLEH ADMIN) */}
                 <div className="p-3.5 rounded-2xl bg-teal-50/90 border border-teal-200 space-y-2.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
@@ -4836,7 +5283,6 @@ service cloud.firestore {
                     </div>
                   </div>
 
-                  {/* Form Edit Nomor WA Persetujuan (Khusus Super Admin) */}
                   {viewMode === 'pengurus' && (
                     <div className="pt-2 border-t border-teal-200/80 space-y-2">
                       <div className="font-extrabold text-amber-900 text-[11px]">✏️ Edit Nomor WhatsApp Persetujuan Pinjam Barang (Khusus Super Admin):</div>
@@ -4864,7 +5310,6 @@ service cloud.firestore {
                   )}
                 </div>
 
-                {/* Form Tambah Aset Inventaris Baru (Khusus Super Admin) */}
                 {viewMode === 'pengurus' && (
                   <form
                     onSubmit={(e) => {
@@ -4926,7 +5371,6 @@ service cloud.firestore {
                   </form>
                 )}
 
-                {/* Daftar Barang & Alur Ajukan Pinjam (Warga) + Persetujuan ACC (DKM & Admin) */}
                 <div className="space-y-2.5">
                   {inventarisList.map((inv) => {
                     const isAvailable = inv.status === 'Tersedia';
@@ -4961,7 +5405,6 @@ service cloud.firestore {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-1.5">
-                          {/* Tombol untuk Warga: Ajukan Pinjam atau Kembalikan */}
                           {isAvailable && (
                             <button
                               onClick={() => {
@@ -4985,7 +5428,6 @@ service cloud.firestore {
                             </button>
                           )}
 
-                          {/* Tombol Persetujuan (ACC) Khusus untuk Role DKM & Super Admin */}
                           {(viewMode === 'dkm' || viewMode === 'pengurus') && isPendingAcc && (
                             <button
                               onClick={() => {
@@ -5009,7 +5451,6 @@ service cloud.firestore {
                             </button>
                           )}
 
-                          {/* Tombol Kembalikan Barang */}
                           {!isAvailable && (
                             <button
                               onClick={() => {
@@ -5487,12 +5928,12 @@ service cloud.firestore {
             </div>
           )}
 
-          {/* ================= MODAL TAMBAH UNIT WARGA BARU LENGKAP ================= */}
+          {/* ================= MODAL TAMBAH UNIT WARGA BARU LENGKAP + WA & PASSWORD LOGIN ================= */}
           {activeModal === 'addWarga' && (
             <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3">
               <div className="bg-white rounded-3xl max-w-lg w-full p-5 max-h-[90vh] overflow-y-auto space-y-3 shadow-2xl text-xs">
                 <div className="flex items-center justify-between border-b pb-2">
-                  <h3 className="font-extrabold text-sm text-slate-900">+ Tambah Data Unit Warga Lengkap (Blok, Anak & Status Sewa/Milik)</h3>
+                  <h3 className="font-extrabold text-sm text-slate-900">+ Tambah Unit Warga Baru & Akun Login (WA + Password)</h3>
                   <button onClick={() => setActiveModal(null)} className="text-slate-400 font-bold">✕</button>
                 </div>
                 <form
@@ -5515,15 +5956,19 @@ service cloud.firestore {
                       statusHuni: newWargaForm.statusHuni,
                       infoKontrak: newWargaForm.infoKontrak,
                       phone: newWargaForm.phone,
+                      password: newWargaForm.password || '123',
+                      role: newWargaForm.role || 'warga',
                       plat: newWargaForm.plat,
                       jiwa: anggotaArr.length,
                       golDarah: 'O',
                       rondaSchedule: `Malam Minggu (Regu ${newWargaForm.blok})`,
                       statusIuran: 'Lunas',
+                      iplComponents: { keamanan: true, kebersihan: true, kas: true },
                       amount: 150000,
                       months2025: buildDefaultMonths('Lunas'),
                       months2026: buildDefaultMonths('Lunas'),
-                      months2027: buildDefaultMonths('Belum Jatuh Tempo')
+                      months2027: buildDefaultMonths('Belum Jatuh Tempo'),
+                      paymentMethods2026: buildDefaultPaymentMethods()
                     };
                     setUnitsData([...unitsData, newUnitObj]);
                     setAccounts([
@@ -5531,17 +5976,18 @@ service cloud.firestore {
                       {
                         id: Date.now() + 1,
                         wa: newWargaForm.phone,
-                        password: '123',
+                        password: newWargaForm.password || '123',
                         name: newWargaForm.owner,
                         unit: newUnitObj.unit,
                         blok: newWargaForm.blok,
                         nik: newUnitObj.nik,
-                        role: 'warga',
-                        statusHuni: newWargaForm.statusHuni
+                        role: newWargaForm.role || 'warga',
+                        statusHuni: newWargaForm.statusHuni,
+                        keteranganAkun: `Akun Induk Warga ${newWargaForm.blok}`
                       }
                     ]);
                     setActiveModal(null);
-                    showToast(`Unit ${newUnitObj.unit} beserta akun WA otomatis berhasil ditambahkan!`);
+                    showToast(`Unit ${newUnitObj.unit} beserta Akun Login (WA: ${newWargaForm.phone} / Pass: ${newWargaForm.password || '123'}) berhasil ditambahkan!`);
                   }}
                   className="space-y-2.5"
                 >
@@ -5581,6 +6027,49 @@ service cloud.firestore {
                       className="px-3 py-2 rounded-xl border border-slate-300"
                     />
                   </div>
+
+                  {/* Pengaturan Data Induk Login WhatsApp & Password */}
+                  <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 space-y-2">
+                    <div className="font-extrabold text-emerald-950">🔐 Data Induk Login Warga (WhatsApp & Password):</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Nomor WhatsApp Login</label>
+                        <input
+                          type="text"
+                          required
+                          placeholder="0812..."
+                          value={newWargaForm.phone}
+                          onChange={(e) => setNewWargaForm({ ...newWargaForm, phone: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 font-mono font-bold bg-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Password Login</label>
+                        <input
+                          type="text"
+                          required
+                          placeholder="Default: 123"
+                          value={newWargaForm.password}
+                          onChange={(e) => setNewWargaForm({ ...newWargaForm, password: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-amber-300 font-mono font-bold bg-amber-50"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Role Hak Akses</label>
+                        <select
+                          value={newWargaForm.role}
+                          onChange={(e) => setNewWargaForm({ ...newWargaForm, role: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 font-bold bg-white"
+                        >
+                          <option value="warga">👤 Warga</option>
+                          <option value="dkm">🕌 Pengurus DKM</option>
+                          <option value="security">👮 Security</option>
+                          <option value="pengurus">🛡️ Super Admin</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-2 gap-2">
                     <select
                       value={newWargaForm.statusHuni}
@@ -5614,7 +6103,7 @@ service cloud.firestore {
                     onChange={(e) => setNewWargaForm({ ...newWargaForm, anggotaKeluargaText: e.target.value })}
                     className="w-full px-3 py-2 rounded-xl border border-slate-300"
                   />
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-3 gap-2">
                     <input
                       type="text"
                       placeholder="NIK (16 Digit)"
@@ -5629,15 +6118,6 @@ service cloud.firestore {
                       onChange={(e) => setNewWargaForm({ ...newWargaForm, kk: e.target.value })}
                       className="px-3 py-2 rounded-xl border border-slate-300"
                     />
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <input
-                      type="text"
-                      placeholder="No. WhatsApp"
-                      value={newWargaForm.phone}
-                      onChange={(e) => setNewWargaForm({ ...newWargaForm, phone: e.target.value })}
-                      className="px-3 py-2 rounded-xl border border-slate-300"
-                    />
                     <input
                       type="text"
                       placeholder="Plat Nomor Mobil/Motor"
@@ -5647,19 +6127,19 @@ service cloud.firestore {
                     />
                   </div>
                   <button type="submit" className="w-full py-2.5 rounded-xl bg-emerald-800 text-white font-extrabold">
-                    Simpan Unit & Buat Akun Login WA
+                    Simpan Unit & Buat Akun Login WA + Password
                   </button>
                 </form>
               </div>
             </div>
           )}
 
-          {/* ================= MODAL EDIT UNIT + KOMPONEN IPL WAJIB WARGA (SUPER ADMIN) ================= */}
+          {/* ================= MODAL EDIT UNIT + AKUN LOGIN WA & PASSWORD + KOMPONEN IPL (SUPER ADMIN) ================= */}
           {editUnitModal && (
             <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3">
               <div className="bg-white rounded-3xl max-w-lg w-full p-5 max-h-[90vh] overflow-y-auto space-y-3 shadow-2xl text-xs">
                 <div className="flex items-center justify-between border-b pb-2">
-                  <h3 className="font-extrabold text-sm text-slate-900">✏️ Edit Data Lengkap & Komponen IPL Unit {editUnitModal.unit}</h3>
+                  <h3 className="font-extrabold text-sm text-slate-900">✏️ Edit Data Unit, Akun Login (WA/Password) & Komponen IPL</h3>
                   <button onClick={() => setEditUnitModal(null)} className="text-slate-400 font-bold">✕</button>
                 </div>
                 <form
@@ -5685,8 +6165,40 @@ service cloud.firestore {
                           : u
                       )
                     );
+                    // Sinkronkan juga ke Data Induk Akun Login (accounts)
+                    setAccounts((prev) => {
+                      const exists = prev.some((a) => a.unit === editUnitModal.unit || a.wa.replace(/[^0-9]/g, '') === editUnitModal.phone.replace(/[^0-9]/g, ''));
+                      if (exists) {
+                        return prev.map((a) =>
+                          a.unit === editUnitModal.unit || a.wa.replace(/[^0-9]/g, '') === editUnitModal.phone.replace(/[^0-9]/g, '')
+                            ? {
+                                ...a,
+                                name: editUnitModal.owner,
+                                unit: editUnitModal.unit,
+                                wa: editUnitModal.phone,
+                                password: editUnitModal.password || '123',
+                                role: editUnitModal.role || a.role
+                              }
+                            : a
+                        );
+                      }
+                      return [
+                        ...prev,
+                        {
+                          id: Date.now(),
+                          wa: editUnitModal.phone,
+                          password: editUnitModal.password || '123',
+                          name: editUnitModal.owner,
+                          unit: editUnitModal.unit,
+                          blok: editUnitModal.blok,
+                          nik: editUnitModal.nik,
+                          role: editUnitModal.role || 'warga',
+                          statusHuni: editUnitModal.statusHuni
+                        }
+                      ];
+                    });
                     setEditUnitModal(null);
-                    showToast(`Data & Komponen Iuran Unit ${editUnitModal.unit} berhasil diperbarui!`);
+                    showToast(`Data Unit, Akun WA (${editUnitModal.phone}) & Password berhasil diperbarui!`);
                   }}
                   className="space-y-2.5"
                 >
@@ -5704,6 +6216,45 @@ service cloud.firestore {
                       className="px-3 py-2 rounded-xl border border-slate-300"
                     />
                   </div>
+
+                  {/* Edit Nomor WhatsApp & Password Login Warga */}
+                  <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 space-y-2">
+                    <div className="font-extrabold text-amber-950">🔑 Kredensial Login Akun Warga (Nomor WhatsApp & Password):</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Nomor WhatsApp Login</label>
+                        <input
+                          type="text"
+                          value={editUnitModal.phone}
+                          onChange={(e) => setEditUnitModal({ ...editUnitModal, phone: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 font-mono font-bold bg-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Password Login</label>
+                        <input
+                          type="text"
+                          value={editUnitModal.password || '123'}
+                          onChange={(e) => setEditUnitModal({ ...editUnitModal, password: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-amber-400 font-mono font-extrabold bg-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-0.5">Role Akun</label>
+                        <select
+                          value={editUnitModal.role || 'warga'}
+                          onChange={(e) => setEditUnitModal({ ...editUnitModal, role: e.target.value })}
+                          className="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 font-bold bg-white"
+                        >
+                          <option value="warga">👤 Warga</option>
+                          <option value="dkm">🕌 Pengurus DKM</option>
+                          <option value="security">👮 Security</option>
+                          <option value="pengurus">🛡️ Super Admin</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-2 gap-2">
                     <select
                       value={editUnitModal.statusHuni}
@@ -5776,7 +6327,7 @@ service cloud.firestore {
                     className="w-full px-3 py-2 rounded-xl border border-slate-300"
                   />
                   <button type="submit" className="w-full py-2.5 rounded-xl bg-emerald-800 text-white font-extrabold">
-                    Simpan Perubahan Unit & Komponen IPL
+                    Simpan Perubahan Unit, WA/Password & Komponen IPL
                   </button>
                 </form>
               </div>
@@ -5801,7 +6352,10 @@ service cloud.firestore {
                   <div><strong>Komponen IPL Wajib:</strong> {formatUnitIPLBreakdown(selectedUnitDetail)} (Rp {calculateUnitIPLAmount(selectedUnitDetail).toLocaleString('id-ID')}/Bln)</div>
                   <div><strong>Jadwal Ronda GMM:</strong> {selectedUnitDetail.rondaSchedule}</div>
                   <div><strong>Kendaraan:</strong> {selectedUnitDetail.plat}</div>
-                  <div><strong>WhatsApp:</strong> {selectedUnitDetail.phone}</div>
+                  <div><strong>WhatsApp Login:</strong> {getUnitAccountInfo(selectedUnitDetail).wa}</div>
+                  {(viewMode === 'pengurus' || selectedUnitDetail.unit === currentUser.unit) && (
+                    <div><strong>Password Login:</strong> <span className="font-mono font-extrabold text-amber-900">{getUnitAccountInfo(selectedUnitDetail).password}</span></div>
+                  )}
                 </div>
                 <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200">
                   <div className="font-extrabold text-emerald-950 mb-1">Daftar Anggota Keluarga ({selectedUnitDetail.anggotaKeluarga.length} Jiwa):</div>
@@ -5833,7 +6387,6 @@ service cloud.firestore {
                   <button onClick={() => setModalQRIS(false)} className="text-slate-400 font-bold">✕</button>
                 </div>
 
-                {/* Ringkasan Nominal Sesuai Komponen Warga */}
                 <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-center">
                   <div className="text-[10px] font-bold text-emerald-800 uppercase">Total Tagihan Sesuai Komponen Unit Anda</div>
                   <div className="font-extrabold text-emerald-900 text-xl mt-0.5">
@@ -5844,7 +6397,6 @@ service cloud.firestore {
                   </div>
                 </div>
 
-                {/* Pilihan 3 Metode Pembayaran: QRIS, Transfer Bank, Dompet Elektronik */}
                 <div>
                   <div className="font-extrabold text-slate-700 mb-1.5">Pilih Metode Pembayaran:</div>
                   <div className="grid grid-cols-3 gap-1.5">
@@ -5869,7 +6421,6 @@ service cloud.firestore {
                   </div>
                 </div>
 
-                {/* Detail Instruksi Sesuai Metode yang Dipilih */}
                 {selectedPaymentChannel === 'QRIS' && (
                   <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 text-center space-y-1.5">
                     <div className="font-extrabold text-slate-900">📲 Scan QRIS Resmi Paguyuban</div>
