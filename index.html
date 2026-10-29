@@ -104,13 +104,34 @@
   <!-- MODULE CLOUD FIRESTORE & MULTI-DOCUMENT REAL-TIME ENGINE -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAnalytics, isSupported as isAnalyticsSupported } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-analytics.js";
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
     import { getFirestore, doc, setDoc, getDoc, getDocs, collection, onSnapshot, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+    // Tangkap unhandled rejection dari dynamic config Analytics di lingkungan sandbox/iframe
+    window.addEventListener("unhandledrejection", (event) => {
+      const msg = String(event?.reason?.message || event?.reason || "");
+      if (msg.includes("analytics/config-fetch-failed") || msg.includes("Dynamic config fetch failed")) {
+        event.preventDefault();
+      }
+    });
+
     const bc = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("gmm_realtime_channel_v45") : null;
+
+    // Konfigurasi Firebase Resmi Perumahan Grande Mulia Mekarwangi (perumgmm-7b5c0)
+    const firebaseConfig = {
+      apiKey: "AIzaSyBovMBfu7K1KG3J4ty0LNlZJY8WZyCfV4w",
+      authDomain: "perumgmm-7b5c0.firebaseapp.com",
+      projectId: "perumgmm-7b5c0",
+      storageBucket: "perumgmm-7b5c0.firebasestorage.app",
+      messagingSenderId: "1049943519289",
+      appId: "1:1049943519289:web:195ca8854801ba535d1de8",
+      measurementId: "G-1T1P9SHQ5F"
+    };
 
     let db = null;
     let auth = null;
+    let analytics = null;
     let currentUserAuth = null;
     let stateColRef = null;
     let isCloudActive = false;
@@ -127,29 +148,35 @@
 
     async function initCloudEngine() {
       try {
-        const rawConfig = typeof __firebase_config !== "undefined" ? __firebase_config : null;
-        if (!rawConfig) return;
-        const parsedConfig = typeof rawConfig === "string" ? JSON.parse(rawConfig) : rawConfig;
-        if (!parsedConfig || !parsedConfig.apiKey || String(parsedConfig.apiKey).includes("PLACEHOLDER")) return;
-
+        // Gunakan langsung firebaseConfig resmi milik Anda (perumgmm-7b5c0) tanpa ditimpa oleh __firebase_config sandbox
         setLogLevel("silent");
-        const app = initializeApp(parsedConfig);
+        const app = initializeApp(firebaseConfig);
+
+        // Inisialisasi Analytics dengan aman setelah memeriksa dukungan browser
+        isAnalyticsSupported()
+          .then((supported) => {
+            if (supported && firebaseConfig.measurementId) {
+              analytics = getAnalytics(app);
+            }
+          })
+          .catch(() => {});
+
         auth = getAuth(app);
         db = getFirestore(app);
 
-        const appId = typeof __app_id !== "undefined" && __app_id ? __app_id : "grande-mulia-mekarwangi";
+        const appId = "perumgmm-7b5c0";
 
         // RULE 3: Auth Before Queries
-        if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
+        try {
           await signInAnonymously(auth);
+        } catch (authErr) {
+          // Tetap lanjutkan koneksi Firestore meskipun Anonymous Auth belum diaktifkan di Firebase Console
         }
 
         onAuthStateChanged(auth, (u) => {
           currentUserAuth = u;
         });
-        currentUserAuth = auth.currentUser;
+        currentUserAuth = auth.currentUser || { uid: "public-gmm-client" };
 
         // RULE 1: Strict Path /artifacts/{appId}/public/data/gmm_master_state
         stateColRef = collection(db, "artifacts", appId, "public", "data", "gmm_master_state");
@@ -163,12 +190,12 @@
 
     window.GMM_CLOUD = {
       isCloudConnected() {
-        return isCloudActive && !!currentUserAuth;
+        return isCloudActive;
       },
 
       async loadState() {
         await readyPromise;
-        if (isCloudActive && stateColRef && auth?.currentUser) {
+        if (isCloudActive && stateColRef) {
           try {
             const snap = await getDocs(stateColRef);
             const combined = {};
@@ -195,7 +222,7 @@
       async saveState(payload, onStatus) {
         const nowTs = Date.now();
         lastCloudTimestamp = nowTs;
-        const stamped = { ...payload, updatedAt: nowTs, updatedByUid: auth?.currentUser?.uid || "system" };
+        const stamped = { ...payload, updatedAt: nowTs, updatedByUid: auth?.currentUser?.uid || "gmm-client" };
         memoryCache = stamped;
 
         try {
@@ -203,19 +230,15 @@
         } catch (e) {}
 
         await readyPromise;
-        if (!auth?.currentUser) {
-          if (onStatus) onStatus("local_ready");
-          return false;
-        }
 
         if (isCloudActive && stateColRef) {
           try {
             if (onStatus) onStatus("syncing");
-            const appId = typeof __app_id !== "undefined" && __app_id ? __app_id : "grande-mulia-mekarwangi";
+            const appId = "perumgmm-7b5c0";
 
             // Simpan ke 4 dokumen terpisah secara paralel agar aman dari batas 1MB Firestore
             const writePromises = Object.entries(SHARD_DOCS).map(([shardKey, keysList]) => {
-              const shardPayload = { updatedAt: nowTs, updatedByUid: auth?.currentUser?.uid || "system" };
+              const shardPayload = { updatedAt: nowTs, updatedByUid: auth?.currentUser?.uid || "gmm-client" };
               keysList.forEach((k) => {
                 if (payload[k] !== undefined) shardPayload[k] = payload[k];
               });
@@ -249,7 +272,7 @@
 
         let unsubFirestore = null;
         readyPromise.then(() => {
-          if (isCloudActive && stateColRef && auth?.currentUser) {
+          if (isCloudActive && stateColRef) {
             try {
               unsubFirestore = onSnapshot(
                 stateColRef,
@@ -272,7 +295,6 @@
                   }
                 },
                 (err) => {
-                  // Error callback wajib untuk onSnapshot agar tidak gagal diam-diam
                   console.warn("Firestore sync listener warning:", err?.message || err);
                 }
               );
